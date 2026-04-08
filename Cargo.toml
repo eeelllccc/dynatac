@@ -10,6 +10,10 @@ rust-version = "1.77"
 name = "dynatac"
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
 
+[[example]]
+name = "display_hello_world"
+harness = false
+
 [profile.release]
 opt-level = "s"
 
