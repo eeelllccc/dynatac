@@ -1,0 +1,39 @@
+[package]
+name = "dynatac"
+version = "0.1.0"
+authors = ["Ed Chapman - Turing <edchapmanelc@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "dynatac"
+harness = false
+
+[[example]]
+name = "display_hello_world"
+harness = false
+
+[[example]]
+name = "keyboard_terminal"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[features]
+default = []
+experimental = ["esp-idf-svc/experimental"]
+
+[dependencies]
+dynatac-core = { path = "../core" }
+log = "0.4"
+esp-idf-svc = "0.51"
+embedded-hal = "1"
+
+[build-dependencies]
+embuild = "0.33"

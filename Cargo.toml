@@ -1,56 +1,10 @@
-[package]
-name = "dynatac"
-version = "0.1.0"
-authors = ["Ed Chapman - Turing <edchapmanelc@gmail.com>"]
-edition = "2021"
+[workspace]
+members = ["core", "device"]
 resolver = "2"
-rust-version = "1.77"
-
-[[bin]]
-name = "dynatac"
-harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
-
-[[example]]
-name = "display_hello_world"
-harness = false
-
-[[example]]
-name = "keyboard_terminal"
-harness = false
 
 [profile.release]
 opt-level = "s"
 
 [profile.dev]
-debug = true    # Symbols are nice and they don't increase the size on Flash
+debug = true
 opt-level = "z"
-
-[features]
-default = []
-
-experimental = ["esp-idf-svc/experimental"]
-
-[dependencies]
-log = "0.4"
-esp-idf-svc = "0.51"
-embedded-hal = "1"
-
-# --- Optional Embassy Integration ---
-# esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
-
-# If you enable embassy-time-driver, you MUST also add one of:
-
-# a) Standalone Embassy libs ( embassy-time, embassy-sync etc) with a foreign async runtime:
-# embassy-time = { version = "0.4.0", features = ["generic-queue-8"] } # NOTE: any generic-queue variant will work
-
-# b) With embassy-executor:
-# embassy-executor = { version = "0.7", features = ["executor-thread", "arch-std"] }
-
-# NOTE: if you use embassy-time with embassy-executor you don't need the generic-queue-8 feature
-
-# --- Temporary workaround for embassy-executor < 0.8 ---
-# esp-idf-svc = { version = "0.51", features = ["embassy-time-driver", "embassy-sync"] }
-# critical-section = { version = "1.1", features = ["std"], default-features = false }
-
-[build-dependencies]
-embuild = "0.33"
