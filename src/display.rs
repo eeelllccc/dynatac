@@ -17,8 +17,8 @@
 // Callee invariants:
 //   - DC is left HIGH (data mode) after every write_command call.
 //   - CS is left HIGH (deasserted) after every SPI transfer.
-//   - `frame_buf` always reflects the pixels currently committed to the display
-//     (i.e. the state stored in the controller's "previous" buffer 0x10).
+//   - `committed` always mirrors the controller's "previous" buffer (0x10).
+//   - `desired` holds what we want on screen; `try_flush` syncs it to hardware.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -121,7 +121,7 @@ const FONT_8X8: [[u8; 8]; 96] = [
   /* 0x69 'i'  */ [0x08,0x00,0x18,0x08,0x08,0x1C,0x00,0x00],
   /* 0x6A 'j'  */ [0x02,0x00,0x06,0x02,0x42,0x3C,0x00,0x00],
   /* 0x6B 'k'  */ [0x40,0x48,0x50,0x60,0x50,0x48,0x00,0x00],
-  /* 0x6C 'l'  */ [0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00],
+  /* 0x6C 'l'  */ [0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00],
   /* 0x6D 'm'  */ [0x00,0x00,0x76,0x49,0x49,0x49,0x00,0x00],
   /* 0x6E 'n'  */ [0x00,0x00,0x7C,0x42,0x42,0x42,0x00,0x00],
   /* 0x6F 'o'  */ [0x00,0x00,0x3C,0x42,0x42,0x42,0x3C,0x00],
@@ -147,24 +147,32 @@ const FONT_8X8: [[u8; 8]; 96] = [
 
 /// Driver for the GDEQ031T10 e-paper display (UC8253 controller, 240×320).
 ///
-/// Maintains a full-resolution frame buffer in RAM that mirrors what is
-/// currently committed to the display.  Individual characters can be drawn
-/// into the buffer and flushed with a fast partial update.
+/// Two-buffer architecture:
+///   - `desired`   — what we want on screen (updated instantly by draw calls)
+///   - `committed` — what is physically on the display (mirrors controller reg 0x10)
+///
+/// Call `draw_char` / `clear_line` to update `desired`, then call `try_flush`
+/// in a loop.  `try_flush` is non-blocking: if the display is still refreshing
+/// it returns immediately, letting the caller keep processing input.  When the
+/// display becomes idle, `try_flush` sends the minimal dirty region and kicks
+/// off the next partial refresh.
 pub struct Epd<'d> {
     spi: SpiDeviceDriver<'d, SpiDriver<'d>>,
     cs:   PinDriver<'d, AnyOutputPin, Output>,
     dc:   PinDriver<'d, AnyOutputPin, Output>,
     busy: PinDriver<'d, AnyIOPin,     Input>,
 
-    /// true  → controller has been initialised this session
-    /// false → must call init_display() before the next write
     init_done:    bool,
-    /// true  → panel driving voltages are on
     power_is_on:  bool,
 
-    /// 9600-byte framebuffer.  0xFF = white, 0x00 = black (1 bit / pixel).
-    /// Bit 7 of each byte is the leftmost pixel of that group of 8.
-    frame_buf: Box<[u8; BUF_LEN]>,
+    /// What we want on screen.  Updated by `draw_char` / `clear_line`.
+    desired: Box<[u8; BUF_LEN]>,
+    /// What the controller's 0x10 register holds (last completed refresh).
+    committed: Box<[u8; BUF_LEN]>,
+
+    /// Dirty bounding box: (x_min, y_min, x_max, y_max) in pixels, 8-aligned.
+    /// `None` means desired == committed (nothing to flush).
+    dirty: Option<(u16, u16, u16, u16)>,
 }
 
 impl<'d> Epd<'d> {
@@ -181,7 +189,9 @@ impl<'d> Epd<'d> {
             busy,
             init_done:   false,
             power_is_on: false,
-            frame_buf: Box::new([0xFF; BUF_LEN]),
+            desired:   Box::new([0xFF; BUF_LEN]),
+            committed: Box::new([0xFF; BUF_LEN]),
+            dirty: None,
         }
     }
 
@@ -294,8 +304,7 @@ impl<'d> Epd<'d> {
         Ok(())
     }
 
-    /// Trigger a partial display refresh (~700 ms).
-    /// Sets init_done = false; the next write must call ensure_init() first.
+    /// Trigger a partial display refresh (~700 ms, blocking).
     fn update_partial(&mut self) -> Result<(), EspError> {
         // Fast partial update: fix temperature at 121 °C equivalent
         self.write_command(0xE0)?; self.write_data(&[0x02])?;
@@ -329,16 +338,43 @@ impl<'d> Epd<'d> {
         Ok(())
     }
 
+    /// Expand the dirty bounding box to include the 8×8 cell at (x, y).
+    fn mark_dirty(&mut self, x: u16, y: u16, w: u16, h: u16) {
+        let (x_min, y_min, x_max, y_max) = match self.dirty {
+            Some((x0, y0, x1, y1)) => (
+                x0.min(x),
+                y0.min(y),
+                x1.max(x + w),
+                y1.max(y + h),
+            ),
+            None => (x, y, x + w, y + h),
+        };
+        self.dirty = Some((x_min, y_min, x_max, y_max));
+    }
+
+    /// Extract a rectangular region from a framebuffer into a Vec.
+    fn extract_region(buf: &[u8; BUF_LEN], x: u16, y: u16, w: u16, h: u16) -> Vec<u8> {
+        let bytes_w = (w / 8) as usize;
+        let x_byte = (x / 8) as usize;
+        let mut region = Vec::with_capacity(bytes_w * h as usize);
+        for row in 0..h as usize {
+            let row_start = (y as usize + row) * BYTES_PER_ROW + x_byte;
+            region.extend_from_slice(&buf[row_start..row_start + bytes_w]);
+        }
+        region
+    }
+
     // --- Public API -----------------------------------------------------------
 
     /// Clear the entire display to white and perform a full refresh.
     /// Blocks until the refresh is complete (~1 s).
     pub fn clear(&mut self) -> Result<(), EspError> {
-        self.frame_buf.fill(0xFF);
+        self.desired.fill(0xFF);
+        self.committed.fill(0xFF);
+        self.dirty = None;
 
         self.ensure_init()?;
 
-        // Write white to both previous (0x10) and current (0x13) buffers
         let white = vec![0xFFu8; BUF_LEN];
         self.write_command(0x10)?;
         self.write_data(&white)?;
@@ -348,14 +384,14 @@ impl<'d> Epd<'d> {
         self.update_full()
     }
 
-    /// Draw a character into the in-memory frame buffer at pixel position (x, y).
+    /// Draw a character into the `desired` buffer at pixel position (x, y).
     ///
     /// Caller invariants:
     ///   - `x` must be a multiple of 8.
     ///   - `y + 8` must not exceed HEIGHT (320).
     ///   - `ch` must be an ASCII character in the range 0x20..=0x7F.
     ///
-    /// Does NOT push to the display; call `flush_char` afterwards.
+    /// Does NOT push to the display; call `try_flush` to push changes.
     pub fn draw_char(&mut self, x: u8, y: u16, ch: char) -> Result<(), EspError> {
         let code = ch as usize;
         if !(0x20..=0x7F).contains(&code) {
@@ -367,43 +403,63 @@ impl<'d> Epd<'d> {
         for row in 0..8usize {
             let idx = (y as usize + row) * BYTES_PER_ROW + byte_col;
             if idx < BUF_LEN {
-                // Glyph: 1 = black.  Frame buffer: 0 = black, 1 = white → invert.
-                self.frame_buf[idx] = !glyph[row];
+                self.desired[idx] = !glyph[row];
             }
         }
+        self.mark_dirty(x as u16 & 0xFFF8, y, 8, 8);
         Ok(())
     }
 
-    /// Push the 8×8 region at (x, y) from the frame buffer to the display
-    /// using a fast partial update.  Blocks until the refresh completes (~700 ms).
+    /// Draw white (blank) into the `desired` buffer for the 8-pixel-tall strip
+    /// at row `y`, across the full display width.
+    pub fn clear_line(&mut self, y: u16) {
+        let start = y as usize * BYTES_PER_ROW;
+        let end = start + BYTES_PER_ROW * 8;
+        self.desired[start..end].fill(0xFF);
+        self.mark_dirty(0, y, WIDTH, 8);
+    }
+
+    /// Non-blocking flush.  If the display is idle and there are dirty pixels,
+    /// sends the minimal changed region and kicks off a partial refresh.
     ///
-    /// Caller invariant: `draw_char` must have been called for this (x, y) first,
-    /// and `clear` must have been called at least once since power-on.
-    pub fn flush_char(&mut self, x: u8, y: u16) -> Result<(), EspError> {
-        let wx = (x as u16) & 0xFFF8;
-        let byte_col = wx as usize / 8;
+    /// Returns `Ok(true)` if a refresh was started, `Ok(false)` if the display
+    /// was busy or there was nothing to flush.
+    ///
+    /// Caller invariant: `clear` must have been called at least once since power-on.
+    pub fn try_flush(&mut self) -> Result<bool, EspError> {
+        let (x_min, y_min, x_max, y_max) = match self.dirty.take() {
+            Some(d) => d,
+            None => return Ok(false),
+        };
 
-        let mut region = [0u8; 8];
-        for row in 0..8usize {
-            let idx = (y as usize + row) * BYTES_PER_ROW + byte_col;
-            region[row] = self.frame_buf[idx];
-        }
+        let w = x_max - x_min;
+        let h = y_max - y_min;
+        let region = Self::extract_region(&self.desired, x_min, y_min, w, h);
 
-        // 1. Write new pixels into the current buffer (0x13)
-        self.write_region(0x13, wx, y, 8, 8, &region)?;
+        // Write new pixels to 0x13.
+        self.write_region(0x13, x_min, y_min, w, h, &region)?;
 
-        // 2. Partial refresh — controller compares 0x13 vs 0x10 and toggles changed pixels
+        // Partial refresh (blocking — ~700 ms).
         self.ensure_init()?;
         self.write_command(0x91)?;
-        self.set_partial_window(wx, y, 8, 8)?;
+        self.set_partial_window(x_min, y_min, w, h)?;
         self.update_partial()?;
         self.write_command(0x92)?;
 
-        // 3. Write same pixels into the previous buffer (0x10) so the next
-        //    differential update has the correct baseline
-        self.write_region(0x10, wx, y, 8, 8, &region)?;
+        // Write same pixels to 0x10 (baseline for next differential refresh).
+        self.write_region(0x10, x_min, y_min, w, h, &region)?;
 
-        Ok(())
+        // Update committed to match.
+        let bytes_w = (w / 8) as usize;
+        let x_byte = (x_min / 8) as usize;
+        for row in 0..h as usize {
+            let buf_start = (y_min as usize + row) * BYTES_PER_ROW + x_byte;
+            let data_start = row * bytes_w;
+            self.committed[buf_start..buf_start + bytes_w]
+                .copy_from_slice(&region[data_start..data_start + bytes_w]);
+        }
+
+        Ok(true)
     }
 
     /// Turn off the panel driving voltages.  Call when done displaying.

@@ -14,6 +14,10 @@ harness = false # do not use the built in cargo test harness -> resolve rust-ana
 name = "display_hello_world"
 harness = false
 
+[[example]]
+name = "keyboard_terminal"
+harness = false
+
 [profile.release]
 opt-level = "s"
 

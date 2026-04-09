@@ -15,3 +15,5 @@ Keyboard: TCA8418 (0x34)
 I'm building ontop of ESP-IDF, so I can use the Rust std lib.
 
 Simple, interpretable, encapsulated, functional code is a priority (like when using OCaml). I want small modules of code that each expose an interface. It's clearly documented what invarients the caller and callee must uphold, and in this way the encapsulation should allow small modules to be independently designed and tested.
+
+The T-Deck-Pro repo is included as a directory, there are lots of useful things including examples to get the different bits of hardware to work. But don't explore the T-Deck-Pro directory speculatively, use `rg` to search it with a specific search command and ask permission before reading files in that directory.

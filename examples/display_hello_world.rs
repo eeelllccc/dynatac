@@ -90,7 +90,11 @@ fn main() {
         let x = (x_start + i * char_w) as u8;
         log::info!("  '{}' at ({}, {})", ch, x, y);
         epd.draw_char(x, y, ch).unwrap();
-        epd.flush_char(x, y).unwrap();
+        // Block until this character's refresh completes before the next one.
+        while !epd.try_flush().unwrap() {
+            sleep(Duration::from_millis(1));
+        }
+        // Wait for refresh to finish before drawing next character.
         sleep(Duration::from_millis(500));
     }
 
