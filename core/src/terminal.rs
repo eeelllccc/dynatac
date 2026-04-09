@@ -56,6 +56,11 @@ impl Terminal {
         }
     }
 
+    /// Clear the scrollback buffer, keeping the input line intact.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+
     /// Feed a key event into the terminal.
     pub fn handle_key(&mut self, event: KeyEvent) -> TerminalAction {
         match event {

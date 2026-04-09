@@ -23,6 +23,8 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::programs::ExecContext;
+use dynatac_core::shell::{Shell, ShellAction};
 use dynatac_core::terminal::{Terminal, TerminalAction};
 use keyboard::Keyboard;
 
@@ -89,6 +91,8 @@ fn main() {
     epd.clear().unwrap();
 
     let mut term = Terminal::new("> ", TERM_COLS, TERM_ROWS);
+    let shell = Shell::new();
+    let boot = std::time::Instant::now();
 
     // Initial render: draw the prompt
     render_terminal(&mut epd, &term);
@@ -108,9 +112,17 @@ fn main() {
                             needs_redraw = true;
                         }
                         TerminalAction::Execute(cmd) => {
-                            // Simple command handler: echo the command back
-                            let output = execute(&cmd);
-                            term.push_output(&output);
+                            let ctx = ExecContext {
+                                uptime_secs: boot.elapsed().as_secs(),
+                            };
+                            match shell.execute(&cmd, &ctx) {
+                                ShellAction::Output(output) => {
+                                    term.push_output(&output);
+                                }
+                                ShellAction::Clear => {
+                                    term.clear();
+                                }
+                            }
                             needs_redraw = true;
                         }
                         TerminalAction::None => {}
@@ -155,16 +167,3 @@ fn flush(epd: &mut Epd) {
     }
 }
 
-/// Toy command handler. Returns the output string for a given command.
-fn execute(cmd: &str) -> String {
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
-        return String::new();
-    }
-    match cmd {
-        "help" => "commands: help, hello, echo <msg>".to_string(),
-        "hello" => "Hello from dynatac!".to_string(),
-        _ if cmd.starts_with("echo ") => cmd[5..].to_string(),
-        _ => format!("unknown command: {}", cmd),
-    }
-}
