@@ -24,8 +24,9 @@ pub enum ShellAction {
 
 /// Which interactive mode the shell is in.
 enum InteractiveState {
-    /// Navigating a list of options.
-    List(ListSelector, &'static str),
+    /// Navigating a list of options. Carries the program name and a context
+    /// string from the command that started the list (e.g. "connect" vs "forget").
+    List(ListSelector, &'static str, String),
     /// Typing into a text prompt. Carries the program name and context
     /// from the previous step (e.g. the selected SSID).
     TextPrompt(TextPrompt, &'static str, String),
@@ -67,13 +68,14 @@ impl Shell {
     /// Caller should only call this when `is_interactive()` is true.
     pub fn handle_interactive_key(&mut self, key: KeyEvent, ctx: &mut ExecContext) -> ShellAction {
         match &mut self.interactive {
-            Some(InteractiveState::List(selector, program_name)) => {
+            Some(InteractiveState::List(selector, program_name, context)) => {
                 let program_name = *program_name;
+                let context = context.clone();
                 match selector.handle_key(key) {
                     ListAction::Redraw => ShellAction::Output(selector.render()),
                     ListAction::Selected(item) => {
                         self.interactive = None;
-                        self.handle_list_selection(&item, program_name, ctx)
+                        self.handle_list_selection(&context, &item, program_name, ctx)
                     }
                     ListAction::None => ShellAction::Output(String::new()),
                 }
@@ -98,6 +100,7 @@ impl Shell {
     /// returns a text prompt signal, transition to text prompt mode.
     fn handle_list_selection(
         &mut self,
+        context: &str,
         item: &str,
         program_name: &'static str,
         ctx: &mut ExecContext,
@@ -105,7 +108,7 @@ impl Shell {
         for program in PROGRAMS {
             if program.name == program_name {
                 if let Some(handler) = program.on_list_select {
-                    let result = handler(item, ctx);
+                    let result = handler(context, item, ctx);
                     if result.output.starts_with("__START_TEXT_PROMPT__\n") {
                         return self.start_text_prompt(&result.output, program_name);
                     }
@@ -150,6 +153,7 @@ impl Shell {
 
     fn start_list(&mut self, output: &str, program_name: &'static str) -> ShellAction {
         let mut lines = output.lines().skip(1); // skip __START_LIST__
+        let context = lines.next().unwrap_or("").to_string();
         let header = lines.next().unwrap_or("").to_string();
         let items: Vec<String> = lines.map(|l| l.to_string()).collect();
         if items.is_empty() {
@@ -157,7 +161,7 @@ impl Shell {
         }
         let selector = ListSelector::new(&header, items);
         let rendered = selector.render();
-        self.interactive = Some(InteractiveState::List(selector, program_name));
+        self.interactive = Some(InteractiveState::List(selector, program_name, context));
         ShellAction::Output(rendered)
     }
 
@@ -188,10 +192,16 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::MockHttpClient;
+    use crate::saved_networks::MockNetworkStore;
     use crate::wifi::MockWifiDriver;
 
-    fn make_ctx(wifi: &mut dyn crate::wifi::WifiDriver) -> ExecContext<'_> {
-        ExecContext { uptime_secs: 42, wifi }
+    fn make_ctx<'a>(
+        wifi: &'a mut dyn crate::wifi::WifiDriver,
+        http: &'a mut dyn crate::http::HttpClient,
+        saved: &'a mut dyn crate::saved_networks::NetworkStore,
+    ) -> ExecContext<'a> {
+        ExecContext { uptime_secs: 42, wifi, http, saved_networks: saved }
     }
 
     fn output(action: ShellAction) -> String {
@@ -205,7 +215,9 @@ mod tests {
     fn empty_input_returns_empty_output() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         assert_eq!(output(s.execute("", &mut ctx)), "");
         assert_eq!(output(s.execute("   ", &mut ctx)), "");
     }
@@ -214,7 +226,9 @@ mod tests {
     fn echo_dispatches() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         assert_eq!(output(s.execute("echo hello world", &mut ctx)), "hello world");
     }
 
@@ -222,7 +236,9 @@ mod tests {
     fn unknown_command() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         assert_eq!(output(s.execute("nosuch", &mut ctx)), "unknown command: nosuch");
     }
 
@@ -230,7 +246,9 @@ mod tests {
     fn clear_returns_clear_action() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         assert!(matches!(s.execute("clear", &mut ctx), ShellAction::Clear));
     }
 
@@ -238,7 +256,9 @@ mod tests {
     fn help_lists_programs() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         let text = output(s.execute("help", &mut ctx));
         assert!(text.contains("echo"));
         assert!(text.contains("clear"));
@@ -251,7 +271,9 @@ mod tests {
     fn wifi_connect_starts_list_mode() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         let text = output(s.execute("wifi connect", &mut ctx));
         assert!(s.is_interactive());
         assert!(text.contains("select network:"));
@@ -262,7 +284,9 @@ mod tests {
     fn list_mode_h_moves_cursor_down() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         s.execute("wifi connect", &mut ctx);
 
         let text = output(s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx));
@@ -274,7 +298,9 @@ mod tests {
     fn list_mode_y_moves_cursor_up() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         s.execute("wifi connect", &mut ctx);
 
         s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx);
@@ -286,7 +312,9 @@ mod tests {
     fn list_mode_enter_transitions_to_text_prompt() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         s.execute("wifi connect", &mut ctx);
 
         s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx); // move to coffee_shop
@@ -300,7 +328,9 @@ mod tests {
     fn text_prompt_submit_connects() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         s.execute("wifi connect", &mut ctx);
 
         // Select coffee_shop
@@ -320,7 +350,9 @@ mod tests {
     fn list_mode_irrelevant_key_returns_empty() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
         s.execute("wifi connect", &mut ctx);
 
         let text = output(s.handle_interactive_key(KeyEvent::Char('x'), &mut ctx));
@@ -334,7 +366,9 @@ mod tests {
     fn full_wifi_flow() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
-        let mut ctx = make_ctx(&mut wifi);
+        let mut http = MockHttpClient::new();
+        let mut saved = MockNetworkStore::new();
+        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
 
         // Initially not connected
         let text = output(s.execute("wifi status", &mut ctx));

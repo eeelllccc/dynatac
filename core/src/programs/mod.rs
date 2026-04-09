@@ -3,8 +3,11 @@
 //! Each program is a function `fn(&[&str], &mut ExecContext) -> ProgramResult`.
 //! Programs live in their own submodules and are registered in [`PROGRAMS`].
 
+use crate::http::HttpClient;
+use crate::saved_networks::NetworkStore;
 use crate::wifi::WifiDriver;
 
+pub mod curl;
 pub mod echo;
 pub mod wifi;
 
@@ -12,6 +15,8 @@ pub mod wifi;
 pub struct ExecContext<'a> {
     pub uptime_secs: u64,
     pub wifi: &'a mut dyn WifiDriver,
+    pub http: &'a mut dyn HttpClient,
+    pub saved_networks: &'a mut dyn NetworkStore,
 }
 
 /// The result of running a program.
@@ -34,7 +39,8 @@ impl ProgramResult {
 pub type ProgramFn = fn(args: &[&str], ctx: &mut ExecContext) -> ProgramResult;
 
 /// Called when the user selects an item from an interactive list.
-pub type OnListSelectFn = fn(selected: &str, ctx: &mut ExecContext) -> ProgramResult;
+/// `context` carries state from the command that started the list (e.g. "connect" vs "forget").
+pub type OnListSelectFn = fn(context: &str, selected: &str, ctx: &mut ExecContext) -> ProgramResult;
 
 /// Called when the user submits text in an interactive prompt.
 /// `context` carries state from the prior step (e.g. selected SSID).
@@ -53,6 +59,13 @@ pub struct Program {
 
 /// All available programs. The shell searches this list by name.
 pub static PROGRAMS: &[Program] = &[
+    Program {
+        name: "curl",
+        usage: "curl <url> — fetch a URL via HTTP GET",
+        run: curl::run,
+        on_list_select: None,
+        on_text_submit: None,
+    },
     Program {
         name: "echo",
         usage: "echo [args...] — print arguments",

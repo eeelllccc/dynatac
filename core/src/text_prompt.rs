@@ -52,6 +52,9 @@ impl TextPrompt {
                 }
             }
             KeyEvent::Enter => TextPromptAction::Submitted(self.input.clone()),
+            KeyEvent::ScrollUp | KeyEvent::ScrollDown | KeyEvent::ScrollBottom => {
+                TextPromptAction::None
+            }
         }
     }
 

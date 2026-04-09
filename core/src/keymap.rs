@@ -29,7 +29,7 @@ const KEYMAP: [[char; COLS as usize]; ROWS as usize] = [
     // col: 0    1    2    3    4    5    6    7    8    9
     ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i',  'o',    'p'   ],  // row 0
     ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k',  'l',    '\x08'],  // row 1  (col9=backspace)
-    ['\0','z', 'x', 'c', 'v', 'b', 'n', 'm',  '$',    '\n'  ],  // row 2  (col0=alt, col8=$, col9=enter)
+    ['\x04','z', 'x', 'c', 'v', 'b', 'n', 'm',  '$',    '\n'  ],  // row 2  (col0=alt, col8=$, col9=enter)
     ['\0','\0','\0','\0','\0', '\x01','\x03',' ',  '\x02','\x01'], // row 3
 ];
 
@@ -37,7 +37,7 @@ const KEYMAP: [[char; COLS as usize]; ROWS as usize] = [
 const SYM_MAP: [[char; COLS as usize]; ROWS as usize] = [
     ['#', '1', '2', '3', '(', ')', '_', '-',  '+',    '@'   ],  // row 0
     ['*', '4', '5', '6', '/', ':', ';', '\'', '"',    '\x08'],  // row 1
-    ['\0','7', '8', '9', '?', '!', '`', '.',  '$',    '\n'  ],  // row 2
+    ['\x04','7', '8', '9', '?', '!', '`', '.',  '$',    '\n'  ],  // row 2
     ['\0','\0','\0','\0','\0', '\x01','\x03',' ',  '\x02','\x01'], // row 3
 ];
 
@@ -50,6 +50,12 @@ pub enum KeyEvent {
     Backspace,
     /// The enter key was pressed.
     Enter,
+    /// Scroll the viewport up (Alt + y).
+    ScrollUp,
+    /// Scroll the viewport down (Alt + h).
+    ScrollDown,
+    /// Jump to the bottom of output (Alt + b).
+    ScrollBottom,
 }
 
 /// Platform-independent key mapper and modifier state machine.
@@ -59,6 +65,7 @@ pub enum KeyEvent {
 pub struct KeyMapper {
     shift_on: bool,
     sym_on: bool,
+    alt_on: bool,
 }
 
 impl KeyMapper {
@@ -66,6 +73,7 @@ impl KeyMapper {
         KeyMapper {
             shift_on: false,
             sym_on: false,
+            alt_on: false,
         }
     }
 
@@ -77,6 +85,11 @@ impl KeyMapper {
     /// Whether the Sym toggle is currently active.
     pub fn sym_on(&self) -> bool {
         self.sym_on
+    }
+
+    /// Whether the Alt toggle is currently active.
+    pub fn alt_on(&self) -> bool {
+        self.alt_on
     }
 
     /// Process a raw key event from the hardware.
@@ -106,9 +119,21 @@ impl KeyMapper {
                 None
             }
             '\x03' | '\0' => None,
+            '\x04' => {
+                self.alt_on = !self.alt_on;
+                None
+            }
             '\x08' => Some(KeyEvent::Backspace),
             '\n' => Some(KeyEvent::Enter),
             c => {
+                if self.alt_on {
+                    match c {
+                        'y' => return Some(KeyEvent::ScrollUp),
+                        'h' => return Some(KeyEvent::ScrollDown),
+                        'b' => return Some(KeyEvent::ScrollBottom),
+                        _ => {}
+                    }
+                }
                 let ch = if self.sym_on {
                     SYM_MAP[row as usize][col as usize]
                 } else if self.shift_on {
@@ -219,10 +244,51 @@ mod tests {
     #[test]
     fn unmapped_keys_return_none() {
         let mut km = KeyMapper::new();
-        // row=2, col=0 = '\0' (alt, unmapped)
-        assert_eq!(km.process(2, 0, true), None);
         // row=3, col=0 = '\0'
         assert_eq!(km.process(3, 0, true), None);
+    }
+
+    #[test]
+    fn alt_toggles() {
+        let mut km = KeyMapper::new();
+        assert!(!km.alt_on());
+        // row=2, col=0 = Alt toggle
+        assert_eq!(km.process(2, 0, true), None);
+        assert!(km.alt_on());
+        assert_eq!(km.process(2, 0, true), None);
+        assert!(!km.alt_on());
+    }
+
+    #[test]
+    fn alt_y_produces_scroll_up() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // 'y' is row=0, col=5
+        assert_eq!(km.process(0, 5, true), Some(KeyEvent::ScrollUp));
+    }
+
+    #[test]
+    fn alt_h_produces_scroll_down() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // 'h' is row=1, col=5
+        assert_eq!(km.process(1, 5, true), Some(KeyEvent::ScrollDown));
+    }
+
+    #[test]
+    fn alt_b_produces_scroll_bottom() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // 'b' is row=2, col=5
+        assert_eq!(km.process(2, 5, true), Some(KeyEvent::ScrollBottom));
+    }
+
+    #[test]
+    fn alt_other_keys_pass_through() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // 'q' is row=0, col=0 — not a scroll key, passes through
+        assert_eq!(km.process(0, 0, true), Some(KeyEvent::Char('q')));
     }
 
     #[test]

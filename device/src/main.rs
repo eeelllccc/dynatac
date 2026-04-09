@@ -1,5 +1,7 @@
 mod display;
+mod http;
 pub mod keyboard;
+mod nvs_network_store;
 mod wifi;
 
 use std::thread::sleep;
@@ -19,6 +21,8 @@ use dynatac_core::shell::{Shell, ShellAction};
 use dynatac_core::terminal::{Terminal, TerminalAction};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use http::EspHttpClient;
+use nvs_network_store::NvsNetworkStore;
 use wifi::EspWifiDriver;
 use keyboard::Keyboard;
 
@@ -83,7 +87,9 @@ fn main() {
     let mut kb = Keyboard::new(i2c).unwrap();
 
     // --- Drivers -----------------------------------------------------------------
-    let mut wifi = EspWifiDriver::new(peripherals.modem, sysloop, Some(nvs));
+    let mut wifi = EspWifiDriver::new(peripherals.modem, sysloop, Some(nvs.clone()));
+    let mut http_client = EspHttpClient::new();
+    let mut saved_networks = NvsNetworkStore::new(nvs);
 
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");
@@ -93,7 +99,13 @@ fn main() {
     let mut shell = Shell::new();
     let boot = std::time::Instant::now();
 
-    // Initial render: draw the prompt
+    // --- Startup tasks ----------------------------------------------------------
+    let boot_log = dynatac_core::startup::run_startup(&mut wifi, &mut saved_networks);
+    for msg in &boot_log {
+        term.push_output(msg);
+    }
+
+    // Initial render: draw the prompt + boot messages
     render_terminal(&mut epd, &term);
     flush(&mut epd);
 
@@ -111,6 +123,8 @@ fn main() {
                         let mut ctx = ExecContext {
                             uptime_secs: boot.elapsed().as_secs(),
                             wifi: &mut wifi,
+                            http: &mut http_client,
+                            saved_networks: &mut saved_networks,
                         };
                         let was_interactive = true;
                         match shell.handle_interactive_key(event, &mut ctx) {
@@ -139,6 +153,8 @@ fn main() {
                                 let mut ctx = ExecContext {
                                     uptime_secs: boot.elapsed().as_secs(),
                                     wifi: &mut wifi,
+                                    http: &mut http_client,
+                                    saved_networks: &mut saved_networks,
                                 };
                                 match shell.execute(&cmd, &mut ctx) {
                                     ShellAction::Output(output) => {

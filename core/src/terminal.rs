@@ -43,6 +43,7 @@ pub struct Terminal {
     cursor: usize,
     prompt: String,
     show_input: bool,
+    scroll_offset: usize,
 }
 
 impl Terminal {
@@ -55,6 +56,7 @@ impl Terminal {
             cursor: 0,
             prompt: prompt.to_string(),
             show_input: true,
+            scroll_offset: 0,
         }
     }
 
@@ -93,17 +95,69 @@ impl Terminal {
                 self.lines.push(submitted);
                 self.input.clear();
                 self.cursor = 0;
+                self.scroll_offset = 0;
                 TerminalAction::Execute(cmd)
+            }
+            KeyEvent::ScrollUp => {
+                let max = self.max_scroll_offset();
+                if self.scroll_offset < max {
+                    self.scroll_offset += 1;
+                }
+                TerminalAction::Redraw
+            }
+            KeyEvent::ScrollDown => {
+                if self.scroll_offset > 0 {
+                    self.scroll_offset -= 1;
+                }
+                TerminalAction::Redraw
+            }
+            KeyEvent::ScrollBottom => {
+                self.scroll_offset = 0;
+                TerminalAction::Redraw
             }
         }
     }
 
     /// Add output text to the scrollback buffer.
     /// Splits on newlines so each line is stored separately.
+    /// Resets scroll to the bottom so the newest content is visible.
     pub fn push_output(&mut self, text: &str) {
         for line in text.split('\n') {
             self.lines.push(line.to_string());
         }
+        self.scroll_offset = 0;
+    }
+
+    /// Wrap all scrollback lines to the terminal width.
+    fn wrapped_output(&self) -> Vec<String> {
+        let mut output_wrapped: Vec<String> = Vec::new();
+        for line in &self.lines {
+            if line.is_empty() {
+                output_wrapped.push(String::new());
+            } else {
+                for chunk in wrap(line, self.cols) {
+                    output_wrapped.push(chunk);
+                }
+            }
+        }
+        output_wrapped
+    }
+
+    /// How many rows the input line occupies.
+    fn input_row_count(&self) -> usize {
+        if self.show_input {
+            let input_display = format!("{}{}_", self.prompt, self.input);
+            wrap(&input_display, self.cols).len().min(self.rows)
+        } else {
+            0
+        }
+    }
+
+    /// Maximum scroll offset (how far up from the bottom you can scroll).
+    fn max_scroll_offset(&self) -> usize {
+        let rows_for_output = self.rows.saturating_sub(self.input_row_count());
+        let total_output = self.wrapped_output().len();
+        total_output.saturating_sub(rows_for_output)
     }
 
     /// Render the visible terminal state as a list of cells to draw.
@@ -126,24 +180,12 @@ impl Terminal {
         };
         let rows_for_output = rows.saturating_sub(input_row_count);
 
-        // Wrap scrollback output
-        let mut output_wrapped: Vec<String> = Vec::new();
-        for line in &self.lines {
-            if line.is_empty() {
-                output_wrapped.push(String::new());
-            } else {
-                for chunk in wrap(line, cols) {
-                    output_wrapped.push(chunk);
-                }
-            }
-        }
+        let output_wrapped = self.wrapped_output();
 
-        // Only show the last `rows_for_output` output rows
-        let visible_output = if output_wrapped.len() > rows_for_output {
-            &output_wrapped[output_wrapped.len() - rows_for_output..]
-        } else {
-            &output_wrapped[..]
-        };
+        // Apply scroll offset: show a window ending at (len - scroll_offset)
+        let end = output_wrapped.len().saturating_sub(self.scroll_offset);
+        let start = end.saturating_sub(rows_for_output);
+        let visible_output = &output_wrapped[start..end];
 
         // Place output rows starting from the top of their visible area
         let output_start_row = rows_for_output - visible_output.len();
@@ -416,6 +458,89 @@ mod tests {
         // Prompt is back on the bottom row
         assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
         // Output moved up one row
+        assert_eq!(row_text(&cells, (R - 2) as u8), "hello");
+    }
+
+    // --- Scroll offset tests ---
+
+    #[test]
+    fn scroll_up_shifts_viewport() {
+        let mut term = term();
+        for i in 0..50 {
+            term.push_output(&format!("line {}", i));
+        }
+        // At bottom: last visible output line is "line 49"
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "line 49");
+
+        // Scroll up one line
+        assert_eq!(term.handle_key(KeyEvent::ScrollUp), TerminalAction::Redraw);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "line 48");
+    }
+
+    #[test]
+    fn scroll_down_moves_back() {
+        let mut term = term();
+        for i in 0..50 {
+            term.push_output(&format!("line {}", i));
+        }
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollDown);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "line 48");
+    }
+
+    #[test]
+    fn scroll_bottom_jumps_to_end() {
+        let mut term = term();
+        for i in 0..50 {
+            term.push_output(&format!("line {}", i));
+        }
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollBottom);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "line 49");
+    }
+
+    #[test]
+    fn scroll_offset_capped_at_max() {
+        let mut term = term();
+        // Push only 5 lines — less than screen height, no scrolling possible
+        for i in 0..5 {
+            term.push_output(&format!("line {}", i));
+        }
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollUp);
+        // scroll_offset should stay at 0 since all content fits
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "line 4");
+    }
+
+    #[test]
+    fn push_output_resets_scroll() {
+        let mut term = term();
+        for i in 0..50 {
+            term.push_output(&format!("line {}", i));
+        }
+        term.handle_key(KeyEvent::ScrollUp);
+        term.handle_key(KeyEvent::ScrollUp);
+        // Now push new output — should reset to bottom
+        term.push_output("new line");
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "new line");
+    }
+
+    #[test]
+    fn scroll_down_does_not_go_below_zero() {
+        let mut term = term();
+        term.push_output("hello");
+        // Scroll down when already at bottom — should be a no-op
+        term.handle_key(KeyEvent::ScrollDown);
+        let cells = term.render();
         assert_eq!(row_text(&cells, (R - 2) as u8), "hello");
     }
 }

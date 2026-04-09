@@ -1,8 +1,11 @@
 pub mod framebuffer;
+pub mod http;
 pub mod keymap;
 pub mod list_selector;
 pub mod programs;
+pub mod saved_networks;
 pub mod shell;
+pub mod startup;
 pub mod terminal;
 pub mod text_prompt;
 pub mod wifi;
