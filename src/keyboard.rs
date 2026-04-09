@@ -137,60 +137,62 @@ impl<'d> Keyboard<'d> {
     /// and return `None`.  Printable characters are transformed
     /// according to the current Shift/Sym state.
     pub fn poll(&mut self) -> Result<Option<KeyEvent>, EspError> {
-        let count = self.read_reg(REG_KEY_LCK_EC)? & 0x0F;
-        if count == 0 {
-            return Ok(None);
-        }
-
-        let raw = self.read_reg(REG_KEY_EVENT_A)?;
-        let pressed = raw & 0x80 != 0;
-        let code = (raw & 0x7F).wrapping_sub(1); // 0-based key index
-
-        // Clear the K_INT bit so new events can fire.
-        self.write_reg(REG_INT_STAT, 0x0F)?;
-
-        if !pressed {
-            return Ok(None); // ignore releases
-        }
-
-        let row = code / COLS;
-        let col = (COLS - 1) - (code % COLS); // hardware column reversal
-
-        if row >= ROWS {
-            log::debug!("key code {} out of range (row={})", code, row);
-            return Ok(None);
-        }
-
-        let base = KEYMAP[row as usize][col as usize];
-        match base {
-            '\x01' => {
-                // Shift toggle
-                self.shift_on = !self.shift_on;
-                log::info!("shift {}", if self.shift_on { "ON" } else { "OFF" });
-                Ok(None)
+        loop {
+            let count = self.read_reg(REG_KEY_LCK_EC)? & 0x0F;
+            if count == 0 {
+                return Ok(None);
             }
-            '\x02' => {
-                // Sym toggle
-                self.sym_on = !self.sym_on;
-                log::info!("sym {}", if self.sym_on { "ON" } else { "OFF" });
-                Ok(None)
+
+            let raw = self.read_reg(REG_KEY_EVENT_A)?;
+            let pressed = raw & 0x80 != 0;
+            let code = (raw & 0x7F).wrapping_sub(1); // 0-based key index
+
+            // Clear K_INT only when FIFO is now empty.
+            let remaining = self.read_reg(REG_KEY_LCK_EC)? & 0x0F;
+            if remaining == 0 {
+                self.write_reg(REG_INT_STAT, 0x0F)?;
             }
-            '\x03' | '\0' => {
-                // Mic or unmapped
-                log::debug!("modifier/unmapped key row={} col={}", row, col);
-                Ok(None)
+
+            if !pressed {
+                continue; // skip releases, read next event
             }
-            '\x08' => Ok(Some(KeyEvent::Backspace)),
-            '\n' => Ok(Some(KeyEvent::Enter)),
-            c => {
-                let ch = if self.sym_on {
-                    SYM_MAP[row as usize][col as usize]
-                } else if self.shift_on {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                Ok(Some(KeyEvent::Char(ch)))
+
+            let row = code / COLS;
+            let col = (COLS - 1) - (code % COLS); // hardware column reversal
+
+            if row >= ROWS {
+                log::debug!("key code {} out of range (row={})", code, row);
+                continue;
+            }
+
+            let base = KEYMAP[row as usize][col as usize];
+            match base {
+                '\x01' => {
+                    self.shift_on = !self.shift_on;
+                    log::info!("shift {}", if self.shift_on { "ON" } else { "OFF" });
+                    continue; // consumed internally
+                }
+                '\x02' => {
+                    self.sym_on = !self.sym_on;
+                    log::info!("sym {}", if self.sym_on { "ON" } else { "OFF" });
+                    continue; // consumed internally
+                }
+                '\x03' | '\0' => {
+                    log::debug!("modifier/unmapped key row={} col={}", row, col);
+                    continue; // consumed internally
+                }
+                '\x08' => return Ok(Some(KeyEvent::Backspace)),
+                '\n' => return Ok(Some(KeyEvent::Enter)),
+                c => {
+                    let ch = if self.sym_on {
+                        SYM_MAP[row as usize][col as usize]
+                    } else if self.shift_on {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    return Ok(Some(KeyEvent::Char(ch)));
+                }
             }
         }
     }

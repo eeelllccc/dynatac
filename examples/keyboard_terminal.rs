@@ -94,49 +94,61 @@ fn main() {
     // --- Event loop --------------------------------------------------------------
     log::info!("Ready — type on the keyboard");
     loop {
-        // 1. Drain all buffered key events (fast — just writes to desired buffer).
-        loop {
-            match kb.poll() {
-                Ok(Some(event)) => {
-                    match event {
-                        KeyEvent::Enter => {
-                            buf = ['\0'; LINE_COLS];
-                            cursor = 0;
-                            log::info!("[enter] — line cleared");
-                        }
-                        KeyEvent::Backspace => {
-                            if cursor > 0 {
-                                cursor -= 1;
-                                buf[cursor] = '\0';
-                                log::info!("[backspace] cursor={}", cursor);
-                            }
-                        }
-                        KeyEvent::Char(ch) => {
-                            if cursor < LINE_COLS {
-                                buf[cursor] = ch;
-                                cursor += 1;
-                                log::info!("'{}' cursor={}", ch, cursor);
-                            }
-                        }
-                    }
-                    // Update desired buffer immediately (no SPI, no blocking).
-                    redraw_line(&mut epd, &buf, cursor);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    log::error!("keyboard poll error: {:?}", e);
-                    break;
-                }
-            }
-        }
+        // 1. Drain all buffered key events (fast — just updates buf/cursor).
+        let dirty = drain_keys(&mut kb, &mut buf, &mut cursor);
 
-        // 2. Push to display if idle (non-blocking).
-        if let Err(e) = epd.try_flush() {
-            log::error!("display flush error: {:?}", e);
+        // 2. Only redraw + flush if something changed.
+        if dirty {
+            redraw_line(&mut epd, &buf, cursor);
+            log::info!("flushing to screen...");
+            if let Err(e) = epd.try_flush() {
+                log::error!("display flush error: {:?}", e);
+            }
+            log::info!("flush complete");
         }
 
         sleep(Duration::from_millis(10));
     }
+}
+
+/// Drain all pending key events from the TCA8418 FIFO into the line buffer.
+/// Returns true if any events were processed.
+fn drain_keys(kb: &mut Keyboard, buf: &mut [char; LINE_COLS], cursor: &mut usize) -> bool {
+    let mut got_key = false;
+    loop {
+        match kb.poll() {
+            Ok(Some(event)) => {
+                got_key = true;
+                match event {
+                    KeyEvent::Enter => {
+                        *buf = ['\0'; LINE_COLS];
+                        *cursor = 0;
+                        log::info!("key: [enter]");
+                    }
+                    KeyEvent::Backspace => {
+                        if *cursor > 0 {
+                            *cursor -= 1;
+                            buf[*cursor] = '\0';
+                            log::info!("key: [backspace] cursor={}", cursor);
+                        }
+                    }
+                    KeyEvent::Char(ch) => {
+                        if *cursor < LINE_COLS {
+                            buf[*cursor] = ch;
+                            *cursor += 1;
+                            log::info!("key: '{}' cursor={}", ch, cursor);
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log::error!("keyboard poll error: {:?}", e);
+                break;
+            }
+        }
+    }
+    got_key
 }
 
 /// Redraw the bottom line into the desired buffer (no display I/O).
