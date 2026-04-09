@@ -11,6 +11,7 @@
 use crate::keymap::KeyEvent;
 use crate::list_selector::{ListAction, ListSelector};
 use crate::programs::{ExecContext, PROGRAMS};
+use crate::text_prompt::{TextPrompt, TextPromptAction};
 
 /// What the caller should do after a command executes.
 #[derive(Debug)]
@@ -21,19 +22,27 @@ pub enum ShellAction {
     Clear,
 }
 
+/// Which interactive mode the shell is in.
+enum InteractiveState {
+    /// Navigating a list of options.
+    List(ListSelector, &'static str),
+    /// Typing into a text prompt. Carries the program name and context
+    /// from the previous step (e.g. the selected SSID).
+    TextPrompt(TextPrompt, &'static str, String),
+}
+
 pub struct Shell {
-    /// Active list selector and the program name that triggered it.
-    active_list: Option<(ListSelector, &'static str)>,
+    interactive: Option<InteractiveState>,
 }
 
 impl Shell {
     pub fn new() -> Self {
-        Self { active_list: None }
+        Self { interactive: None }
     }
 
-    /// Whether the shell is in interactive list mode.
+    /// Whether the shell is in an interactive mode (list or text prompt).
     pub fn is_interactive(&self) -> bool {
-        self.active_list.is_some()
+        self.interactive.is_some()
     }
 
     /// Parse `line` and execute the command. Returns an action for the caller.
@@ -54,39 +63,82 @@ impl Shell {
         }
     }
 
-    /// Handle a key event while in interactive list mode.
+    /// Handle a key event while in interactive mode.
     /// Caller should only call this when `is_interactive()` is true.
-    pub fn handle_list_key(&mut self, key: KeyEvent, ctx: &mut ExecContext) -> ShellAction {
-        let (selector, program_name) = match &mut self.active_list {
-            Some(pair) => pair,
-            None => return ShellAction::Output(String::new()),
-        };
-
-        match selector.handle_key(key) {
-            ListAction::Redraw => ShellAction::Output(selector.render()),
-            ListAction::Selected(item) => {
+    pub fn handle_interactive_key(&mut self, key: KeyEvent, ctx: &mut ExecContext) -> ShellAction {
+        match &mut self.interactive {
+            Some(InteractiveState::List(selector, program_name)) => {
                 let program_name = *program_name;
-                self.active_list = None;
-                // Find the program and call its on_list_select handler
-                for program in PROGRAMS {
-                    if program.name == program_name {
-                        if let Some(handler) = program.on_list_select {
-                            let result = handler(&item, ctx);
-                            return ShellAction::Output(result.output);
-                        }
+                match selector.handle_key(key) {
+                    ListAction::Redraw => ShellAction::Output(selector.render()),
+                    ListAction::Selected(item) => {
+                        self.interactive = None;
+                        self.handle_list_selection(&item, program_name, ctx)
                     }
+                    ListAction::None => ShellAction::Output(String::new()),
                 }
-                ShellAction::Output(format!("selected: {}", item))
             }
-            ListAction::None => ShellAction::Output(String::new()),
+            Some(InteractiveState::TextPrompt(prompt, program_name, context)) => {
+                let program_name = *program_name;
+                let context = context.clone();
+                match prompt.handle_key(key) {
+                    TextPromptAction::Redraw => ShellAction::Output(prompt.render()),
+                    TextPromptAction::Submitted(text) => {
+                        self.interactive = None;
+                        self.handle_text_submit(&context, &text, program_name, ctx)
+                    }
+                    TextPromptAction::None => ShellAction::Output(String::new()),
+                }
+            }
+            None => ShellAction::Output(String::new()),
         }
+    }
+
+    /// Process the result of a list selection. If the program's on_list_select
+    /// returns a text prompt signal, transition to text prompt mode.
+    fn handle_list_selection(
+        &mut self,
+        item: &str,
+        program_name: &'static str,
+        ctx: &mut ExecContext,
+    ) -> ShellAction {
+        for program in PROGRAMS {
+            if program.name == program_name {
+                if let Some(handler) = program.on_list_select {
+                    let result = handler(item, ctx);
+                    if result.output.starts_with("__START_TEXT_PROMPT__\n") {
+                        return self.start_text_prompt(&result.output, program_name);
+                    }
+                    return ShellAction::Output(result.output);
+                }
+            }
+        }
+        ShellAction::Output(format!("selected: {}", item))
+    }
+
+    /// Call the program's on_text_submit handler.
+    fn handle_text_submit(
+        &mut self,
+        context: &str,
+        text: &str,
+        program_name: &'static str,
+        ctx: &mut ExecContext,
+    ) -> ShellAction {
+        for program in PROGRAMS {
+            if program.name == program_name {
+                if let Some(handler) = program.on_text_submit {
+                    let result = handler(context, text, ctx);
+                    return ShellAction::Output(result.output);
+                }
+            }
+        }
+        ShellAction::Output(String::new())
     }
 
     fn dispatch(&mut self, cmd: &str, args: &[&str], ctx: &mut ExecContext) -> ShellAction {
         for program in PROGRAMS {
             if program.name == cmd {
                 let result = (program.run)(args, ctx);
-                // Check if the output is a list request
                 if result.output.starts_with("__START_LIST__\n") {
                     return self.start_list(&result.output, program.name);
                 }
@@ -105,7 +157,21 @@ impl Shell {
         }
         let selector = ListSelector::new(&header, items);
         let rendered = selector.render();
-        self.active_list = Some((selector, program_name));
+        self.interactive = Some(InteractiveState::List(selector, program_name));
+        ShellAction::Output(rendered)
+    }
+
+    fn start_text_prompt(&mut self, output: &str, program_name: &'static str) -> ShellAction {
+        let mut lines = output.lines().skip(1); // skip __START_TEXT_PROMPT__
+        let context = lines.next().unwrap_or("").to_string();
+        let header = lines.next().unwrap_or("").to_string();
+        let prompt = TextPrompt::new(&header);
+        let rendered = prompt.render();
+        self.interactive = Some(InteractiveState::TextPrompt(
+            prompt,
+            program_name,
+            context,
+        ));
         ShellAction::Output(rendered)
     }
 
@@ -199,7 +265,7 @@ mod tests {
         let mut ctx = make_ctx(&mut wifi);
         s.execute("wifi connect", &mut ctx);
 
-        let text = output(s.handle_list_key(KeyEvent::Char('h'), &mut ctx));
+        let text = output(s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx));
         assert!(text.contains("> coffee_shop"));
         assert!(text.contains("  home_wifi"));
     }
@@ -211,20 +277,41 @@ mod tests {
         let mut ctx = make_ctx(&mut wifi);
         s.execute("wifi connect", &mut ctx);
 
-        s.handle_list_key(KeyEvent::Char('h'), &mut ctx);
-        let text = output(s.handle_list_key(KeyEvent::Char('y'), &mut ctx));
+        s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx);
+        let text = output(s.handle_interactive_key(KeyEvent::Char('y'), &mut ctx));
         assert!(text.contains("> home_wifi"));
     }
 
     #[test]
-    fn list_mode_enter_selects_and_exits() {
+    fn list_mode_enter_transitions_to_text_prompt() {
         let mut s = Shell::new();
         let mut wifi = MockWifiDriver::new();
         let mut ctx = make_ctx(&mut wifi);
         s.execute("wifi connect", &mut ctx);
 
-        s.handle_list_key(KeyEvent::Char('h'), &mut ctx); // move to coffee_shop
-        let text = output(s.handle_list_key(KeyEvent::Enter, &mut ctx));
+        s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx); // move to coffee_shop
+        let text = output(s.handle_interactive_key(KeyEvent::Enter, &mut ctx));
+        // Should now be in text prompt mode, not connected yet
+        assert!(s.is_interactive());
+        assert!(text.contains("password:"));
+    }
+
+    #[test]
+    fn text_prompt_submit_connects() {
+        let mut s = Shell::new();
+        let mut wifi = MockWifiDriver::new();
+        let mut ctx = make_ctx(&mut wifi);
+        s.execute("wifi connect", &mut ctx);
+
+        // Select coffee_shop
+        s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Enter, &mut ctx);
+        assert!(s.is_interactive()); // in text prompt mode
+
+        // Type password and submit
+        s.handle_interactive_key(KeyEvent::Char('p'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Char('w'), &mut ctx);
+        let text = output(s.handle_interactive_key(KeyEvent::Enter, &mut ctx));
         assert_eq!(text, "connected to coffee_shop");
         assert!(!s.is_interactive());
     }
@@ -236,7 +323,7 @@ mod tests {
         let mut ctx = make_ctx(&mut wifi);
         s.execute("wifi connect", &mut ctx);
 
-        let text = output(s.handle_list_key(KeyEvent::Char('x'), &mut ctx));
+        let text = output(s.handle_interactive_key(KeyEvent::Char('x'), &mut ctx));
         assert_eq!(text, "");
         assert!(s.is_interactive());
     }
@@ -257,10 +344,17 @@ mod tests {
         s.execute("wifi connect", &mut ctx);
         assert!(s.is_interactive());
 
-        // Navigate to neighbor_5g (index 2)
-        s.handle_list_key(KeyEvent::Char('h'), &mut ctx);
-        s.handle_list_key(KeyEvent::Char('h'), &mut ctx);
-        let text = output(s.handle_list_key(KeyEvent::Enter, &mut ctx));
+        // Navigate to neighbor_5g (index 2) and select
+        s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Char('h'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Enter, &mut ctx);
+
+        // Now in text prompt mode — type password and submit
+        assert!(s.is_interactive());
+        s.handle_interactive_key(KeyEvent::Char('s'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Char('e'), &mut ctx);
+        s.handle_interactive_key(KeyEvent::Char('c'), &mut ctx);
+        let text = output(s.handle_interactive_key(KeyEvent::Enter, &mut ctx));
         assert_eq!(text, "connected to neighbor_5g");
         assert!(!s.is_interactive());
 

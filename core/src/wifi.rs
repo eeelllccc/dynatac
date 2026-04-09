@@ -19,9 +19,9 @@ pub enum WifiStatus {
 
 /// Hardware-agnostic WiFi interface.
 pub trait WifiDriver {
-    fn scan(&self) -> Vec<String>;
+    fn scan(&mut self) -> Vec<String>;
     fn status(&self) -> WifiStatus;
-    fn connect(&mut self, network: &str) -> Result<(), String>;
+    fn connect(&mut self, network: &str, password: &str) -> Result<(), String>;
     fn disconnect(&mut self) -> Result<(), String>;
 }
 
@@ -45,7 +45,7 @@ impl MockWifiDriver {
 }
 
 impl WifiDriver for MockWifiDriver {
-    fn scan(&self) -> Vec<String> {
+    fn scan(&mut self) -> Vec<String> {
         self.networks.clone()
     }
 
@@ -56,7 +56,7 @@ impl WifiDriver for MockWifiDriver {
         }
     }
 
-    fn connect(&mut self, network: &str) -> Result<(), String> {
+    fn connect(&mut self, network: &str, _password: &str) -> Result<(), String> {
         if !self.networks.iter().any(|n| n == network) {
             return Err(format!("network not found: {}", network));
         }
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn scan_returns_three_networks() {
-        let driver = MockWifiDriver::new();
+        let mut driver = MockWifiDriver::new();
         let networks = driver.scan();
         assert_eq!(networks.len(), 3);
         assert!(networks.contains(&"home_wifi".to_string()));
@@ -96,21 +96,21 @@ mod tests {
     #[test]
     fn connect_to_existing_network() {
         let mut driver = MockWifiDriver::new();
-        assert!(driver.connect("home_wifi").is_ok());
+        assert!(driver.connect("home_wifi", "").is_ok());
         assert_eq!(driver.status(), WifiStatus::Connected("home_wifi".to_string()));
     }
 
     #[test]
     fn connect_to_nonexistent_network_fails() {
         let mut driver = MockWifiDriver::new();
-        let err = driver.connect("doesnt_exist").unwrap_err();
+        let err = driver.connect("doesnt_exist", "").unwrap_err();
         assert_eq!(err, "network not found: doesnt_exist");
     }
 
     #[test]
     fn disconnect_when_connected() {
         let mut driver = MockWifiDriver::new();
-        driver.connect("coffee_shop").unwrap();
+        driver.connect("coffee_shop", "").unwrap();
         assert!(driver.disconnect().is_ok());
         assert_eq!(driver.status(), WifiStatus::Disconnected);
     }
@@ -125,8 +125,8 @@ mod tests {
     #[test]
     fn connect_switches_network() {
         let mut driver = MockWifiDriver::new();
-        driver.connect("home_wifi").unwrap();
-        driver.connect("coffee_shop").unwrap();
+        driver.connect("home_wifi", "").unwrap();
+        driver.connect("coffee_shop", "").unwrap();
         assert_eq!(driver.status(), WifiStatus::Connected("coffee_shop".to_string()));
     }
 }

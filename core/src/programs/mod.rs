@@ -36,6 +36,10 @@ pub type ProgramFn = fn(args: &[&str], ctx: &mut ExecContext) -> ProgramResult;
 /// Called when the user selects an item from an interactive list.
 pub type OnListSelectFn = fn(selected: &str, ctx: &mut ExecContext) -> ProgramResult;
 
+/// Called when the user submits text in an interactive prompt.
+/// `context` carries state from the prior step (e.g. selected SSID).
+pub type OnTextSubmitFn = fn(context: &str, text: &str, ctx: &mut ExecContext) -> ProgramResult;
+
 /// A program registered in the shell.
 pub struct Program {
     pub name: &'static str,
@@ -43,6 +47,8 @@ pub struct Program {
     pub run: ProgramFn,
     /// If this program can trigger a list selection, this handles the result.
     pub on_list_select: Option<OnListSelectFn>,
+    /// If this program can trigger a text prompt, this handles the submitted text.
+    pub on_text_submit: Option<OnTextSubmitFn>,
 }
 
 /// All available programs. The shell searches this list by name.
@@ -52,11 +58,13 @@ pub static PROGRAMS: &[Program] = &[
         usage: "echo [args...] — print arguments",
         run: echo::run,
         on_list_select: None,
+        on_text_submit: None,
     },
     Program {
         name: "wifi",
         usage: "wifi [status|connect|disconnect]",
         run: wifi::run,
         on_list_select: Some(wifi::on_list_select),
+        on_text_submit: Some(wifi::on_text_submit),
     },
 ];

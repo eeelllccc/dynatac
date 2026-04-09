@@ -21,9 +21,21 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
 }
 
 /// Called by the shell when the user selects a network from the list.
-pub fn on_list_select(selected: &str, ctx: &mut ExecContext) -> ProgramResult {
-    match ctx.wifi.connect(selected) {
-        Ok(()) => ProgramResult::ok(format!("connected to {}", selected)),
+/// Returns a text prompt signal so the shell collects a password next.
+pub fn on_list_select(selected: &str, _ctx: &mut ExecContext) -> ProgramResult {
+    // Signal the shell to enter text prompt mode.
+    // Format: "__START_TEXT_PROMPT__\ncontext_value\nheader_text"
+    ProgramResult::ok(format!(
+        "__START_TEXT_PROMPT__\n{}\npassword:",
+        selected
+    ))
+}
+
+/// Called by the shell after the user submits text in the prompt.
+/// `context` is the selected SSID; `text` is the password.
+pub fn on_text_submit(context: &str, text: &str, ctx: &mut ExecContext) -> ProgramResult {
+    match ctx.wifi.connect(context, text) {
+        Ok(()) => ProgramResult::ok(format!("connected to {}", context)),
         Err(e) => ProgramResult::err(e),
     }
 }
@@ -93,7 +105,7 @@ mod tests {
     #[test]
     fn status_when_connected() {
         let mut wifi = MockWifiDriver::new();
-        wifi.connect("home_wifi").unwrap();
+        wifi.connect("home_wifi", "").unwrap();
         let mut ctx = make_ctx(&mut wifi);
         let r = run(&["status"], &mut ctx);
         assert_eq!(r.output, "connected to home_wifi");
@@ -113,7 +125,7 @@ mod tests {
     #[test]
     fn disconnect_when_connected() {
         let mut wifi = MockWifiDriver::new();
-        wifi.connect("home_wifi").unwrap();
+        wifi.connect("home_wifi", "").unwrap();
         let mut ctx = make_ctx(&mut wifi);
         let r = run(&["disconnect"], &mut ctx);
         assert_eq!(r.output, "disconnected");
@@ -130,19 +142,29 @@ mod tests {
     }
 
     #[test]
-    fn on_list_select_connects() {
+    fn on_list_select_returns_text_prompt() {
         let mut wifi = MockWifiDriver::new();
         let mut ctx = make_ctx(&mut wifi);
         let r = on_list_select("coffee_shop", &mut ctx);
+        assert!(r.output.starts_with("__START_TEXT_PROMPT__"));
+        assert!(r.output.contains("coffee_shop"));
+        assert!(r.output.contains("password:"));
+    }
+
+    #[test]
+    fn on_text_submit_connects() {
+        let mut wifi = MockWifiDriver::new();
+        let mut ctx = make_ctx(&mut wifi);
+        let r = on_text_submit("coffee_shop", "secret", &mut ctx);
         assert_eq!(r.output, "connected to coffee_shop");
         assert_eq!(r.exit_code, 0);
     }
 
     #[test]
-    fn on_list_select_invalid_network() {
+    fn on_text_submit_invalid_network() {
         let mut wifi = MockWifiDriver::new();
         let mut ctx = make_ctx(&mut wifi);
-        let r = on_list_select("doesnt_exist", &mut ctx);
+        let r = on_text_submit("doesnt_exist", "secret", &mut ctx);
         assert_eq!(r.exit_code, 1);
     }
 }

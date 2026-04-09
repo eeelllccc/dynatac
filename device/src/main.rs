@@ -1,5 +1,6 @@
 mod display;
 pub mod keyboard;
+mod wifi;
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -16,7 +17,9 @@ use display::Epd;
 use dynatac_core::programs::ExecContext;
 use dynatac_core::shell::{Shell, ShellAction};
 use dynatac_core::terminal::{Terminal, TerminalAction};
-use dynatac_core::wifi::MockWifiDriver;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use wifi::EspWifiDriver;
 use keyboard::Keyboard;
 
 /// Row height in pixels: 8px font + 2px gap.
@@ -33,6 +36,8 @@ fn main() {
     log::info!("Booting dynatac OS");
 
     let peripherals = Peripherals::take().unwrap();
+    let sysloop = EspSystemEventLoop::take().unwrap();
+    let nvs = EspDefaultNvsPartition::take().unwrap();
     let pins = peripherals.pins;
 
     // --- Deselect other SPI devices on the shared bus ----------------------------
@@ -78,7 +83,7 @@ fn main() {
     let mut kb = Keyboard::new(i2c).unwrap();
 
     // --- Drivers -----------------------------------------------------------------
-    let mut wifi = MockWifiDriver::new();
+    let mut wifi = EspWifiDriver::new(peripherals.modem, sysloop, Some(nvs));
 
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");
@@ -108,7 +113,7 @@ fn main() {
                             wifi: &mut wifi,
                         };
                         let was_interactive = true;
-                        match shell.handle_list_key(event, &mut ctx) {
+                        match shell.handle_interactive_key(event, &mut ctx) {
                             ShellAction::Output(output) => {
                                 if !output.is_empty() {
                                     term.clear();
