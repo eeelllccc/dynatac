@@ -42,6 +42,7 @@ pub struct Terminal {
     input: String,
     cursor: usize,
     prompt: String,
+    show_input: bool,
 }
 
 impl Terminal {
@@ -53,12 +54,19 @@ impl Terminal {
             input: String::new(),
             cursor: 0,
             prompt: prompt.to_string(),
+            show_input: true,
         }
     }
 
     /// Clear the scrollback buffer, keeping the input line intact.
     pub fn clear(&mut self) {
         self.lines.clear();
+    }
+
+    /// Show or hide the input line (prompt + cursor).
+    /// When hidden, all rows are used for output.
+    pub fn set_show_input(&mut self, show: bool) {
+        self.show_input = show;
     }
 
     /// Feed a key event into the terminal.
@@ -107,13 +115,15 @@ impl Terminal {
         let cols = self.cols;
         let rows = self.rows;
 
-        // Build the full input display including the cursor character.
-        // This ensures wrapping accounts for the cursor needing a cell.
-        let input_display = format!("{}{}_", self.prompt, self.input);
-
-        // Wrap input into screen rows
-        let input_wrapped = wrap(&input_display, cols);
-        let input_row_count = input_wrapped.len().min(rows);
+        // When input is hidden, all rows go to output.
+        let (input_wrapped, input_row_count) = if self.show_input {
+            let input_display = format!("{}{}_", self.prompt, self.input);
+            let wrapped = wrap(&input_display, cols);
+            let count = wrapped.len().min(rows);
+            (wrapped, count)
+        } else {
+            (Vec::new(), 0)
+        };
         let rows_for_output = rows.saturating_sub(input_row_count);
 
         // Wrap scrollback output
@@ -376,5 +386,36 @@ mod tests {
         assert_eq!(row_text(&cells, (R - 2) as u8), "line3");
         assert_eq!(row_text(&cells, (R - 3) as u8), "line2");
         assert_eq!(row_text(&cells, (R - 4) as u8), "line1");
+    }
+
+    // Step 11: Hidden input line
+    #[test]
+    fn hidden_input_gives_all_rows_to_output() {
+        let mut term = term();
+        term.set_show_input(false);
+        term.push_output("hello");
+
+        let cells = term.render();
+        // Output should appear on the last row (no input line taking space)
+        assert_eq!(row_text(&cells, (R - 1) as u8), "hello");
+        // No prompt or cursor anywhere
+        let has_prompt = cells.iter().any(|c| c.ch == '>');
+        assert!(!has_prompt);
+        let has_cursor = cells.iter().any(|c| c.ch == '_');
+        assert!(!has_cursor);
+    }
+
+    #[test]
+    fn show_input_restores_prompt() {
+        let mut term = term();
+        term.set_show_input(false);
+        term.push_output("hello");
+        term.set_show_input(true);
+
+        let cells = term.render();
+        // Prompt is back on the bottom row
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+        // Output moved up one row
+        assert_eq!(row_text(&cells, (R - 2) as u8), "hello");
     }
 }
