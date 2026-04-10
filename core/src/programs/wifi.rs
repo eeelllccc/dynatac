@@ -36,9 +36,9 @@ pub fn on_list_select(context: &str, selected: &str, ctx: &mut ExecContext) -> P
                     Err(e) => ProgramResult::err(e),
                 }
             } else {
-                // No saved password — prompt the user.
+                // No saved password — prompt the user (masked input).
                 ProgramResult::ok(format!(
-                    "__START_TEXT_PROMPT__\n{}\npassword:",
+                    "__START_TEXT_PROMPT__\nmask\n{}\npassword:",
                     selected
                 ))
             }

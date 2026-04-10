@@ -95,8 +95,9 @@ fn start_setup(ctx: &mut ExecContext) -> ProgramResult {
         Some(creds) => format!("Gmail address (replacing {}):", creds.address),
         None => "Gmail address:".to_string(),
     };
+    // Address is not a secret — echo it verbatim.
     ProgramResult::ok(format!(
-        "__START_TEXT_PROMPT__\n{}\n{}",
+        "__START_TEXT_PROMPT__\nplain\n{}\n{}",
         ADDRESS_CONTEXT, header
     ))
 }
@@ -121,8 +122,9 @@ fn on_address_submit(text: &str, ctx: &mut ExecContext) -> ProgramResult {
     } else {
         "App password:".to_string()
     };
+    // Password is a secret — mask the input.
     ProgramResult::ok(format!(
-        "__START_TEXT_PROMPT__\n{}{}\n{}",
+        "__START_TEXT_PROMPT__\nmask\n{}{}\n{}",
         PASSWORD_CONTEXT_PREFIX, address, header
     ))
 }
@@ -312,8 +314,9 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         let lines: Vec<&str> = r.output.lines().collect();
         assert_eq!(lines[0], "__START_TEXT_PROMPT__");
-        assert_eq!(lines[1], "address");
-        assert_eq!(lines[2], "Gmail address:");
+        assert_eq!(lines[1], "plain", "address prompt should not mask input");
+        assert_eq!(lines[2], "address");
+        assert_eq!(lines[3], "Gmail address:");
     }
 
     #[test]
@@ -323,8 +326,9 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         let lines: Vec<&str> = r.output.lines().collect();
         assert_eq!(lines[0], "__START_TEXT_PROMPT__");
-        assert_eq!(lines[1], "password|me@gmail.com");
-        assert_eq!(lines[2], "App password:");
+        assert_eq!(lines[1], "mask", "password prompt should mask input");
+        assert_eq!(lines[2], "password|me@gmail.com");
+        assert_eq!(lines[3], "App password:");
     }
 
     #[test]
@@ -376,8 +380,9 @@ mod tests {
         let r = run(&["setup"], &mut env.ctx());
         let lines: Vec<&str> = r.output.lines().collect();
         assert_eq!(lines[0], "__START_TEXT_PROMPT__");
-        assert_eq!(lines[1], "address");
-        assert_eq!(lines[2], "Gmail address (replacing old@gmail.com):");
+        assert_eq!(lines[1], "plain");
+        assert_eq!(lines[2], "address");
+        assert_eq!(lines[3], "Gmail address (replacing old@gmail.com):");
     }
 
     #[test]
@@ -386,7 +391,7 @@ mod tests {
         env.creds.set_gmail("old@gmail.com", "oldpw").unwrap();
         let r = on_text_submit("address", "new@gmail.com", &mut env.ctx());
         let lines: Vec<&str> = r.output.lines().collect();
-        assert_eq!(lines[2], "App password (empty to cancel):");
+        assert_eq!(lines[3], "App password (empty to cancel):");
     }
 
     #[test]

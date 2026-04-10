@@ -186,11 +186,23 @@ impl Shell {
         ShellAction::Output(rendered)
     }
 
+    /// Signal format:
+    /// ```text
+    /// __START_TEXT_PROMPT__
+    /// <mode>            // "mask" or "plain"
+    /// <context>         // opaque string passed back to on_text_submit
+    /// <header>          // displayed above the input line
+    /// ```
     fn start_text_prompt(&mut self, output: &str, program_name: &'static str) -> ShellAction {
         let mut lines = output.lines().skip(1); // skip __START_TEXT_PROMPT__
+        let mode = lines.next().unwrap_or("mask");
         let context = lines.next().unwrap_or("").to_string();
         let header = lines.next().unwrap_or("").to_string();
-        let prompt = TextPrompt::new(&header);
+        let prompt = match mode {
+            "plain" => TextPrompt::plain(&header),
+            // Default to masked: safer if a caller forgets the mode line.
+            _ => TextPrompt::masked(&header),
+        };
         let rendered = prompt.render();
         self.interactive = Some(InteractiveState::TextPrompt(
             prompt,
