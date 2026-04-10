@@ -1,7 +1,9 @@
 mod display;
 mod http;
 pub mod keyboard;
+mod nvs_credential_store;
 mod nvs_network_store;
+mod smtp;
 mod wifi;
 
 use std::thread::sleep;
@@ -22,7 +24,9 @@ use dynatac_core::terminal::{Terminal, TerminalAction};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use http::EspHttpClient;
+use nvs_credential_store::NvsCredentialStore;
 use nvs_network_store::NvsNetworkStore;
+use smtp::EspSmtpStreamFactory;
 use wifi::EspWifiDriver;
 use keyboard::Keyboard;
 
@@ -89,7 +93,9 @@ fn main() {
     // --- Drivers -----------------------------------------------------------------
     let mut wifi = EspWifiDriver::new(peripherals.modem, sysloop, Some(nvs.clone()));
     let mut http_client = EspHttpClient::new();
-    let mut saved_networks = NvsNetworkStore::new(nvs);
+    let mut saved_networks = NvsNetworkStore::new(nvs.clone());
+    let mut credentials = NvsCredentialStore::new(nvs);
+    let mut smtp_factory = EspSmtpStreamFactory::new();
 
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");
@@ -125,6 +131,8 @@ fn main() {
                             wifi: &mut wifi,
                             http: &mut http_client,
                             saved_networks: &mut saved_networks,
+                            smtp: &mut smtp_factory,
+                            credentials: &mut credentials,
                         };
                         let was_interactive = true;
                         match shell.handle_interactive_key(event, &mut ctx) {
@@ -155,6 +163,8 @@ fn main() {
                                     wifi: &mut wifi,
                                     http: &mut http_client,
                                     saved_networks: &mut saved_networks,
+                                    smtp: &mut smtp_factory,
+                                    credentials: &mut credentials,
                                 };
                                 match shell.execute(&cmd, &mut ctx) {
                                     ShellAction::Output(output) => {

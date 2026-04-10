@@ -1,3 +1,5 @@
+pub mod credentials;
+pub mod email;
 pub mod framebuffer;
 pub mod http;
 pub mod keymap;

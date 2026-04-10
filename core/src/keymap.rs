@@ -50,6 +50,12 @@ pub enum KeyEvent {
     Backspace,
     /// The enter key was pressed.
     Enter,
+    /// Shift+Enter: insert a newline into the input buffer instead of submitting.
+    SoftEnter,
+    /// Alt+Backspace: cancel the current operation. In interactive list /
+    /// text-prompt mode this exits the mode; at the regular prompt it
+    /// clears the input line.
+    Cancel,
     /// Scroll the viewport up (Alt + y).
     ScrollUp,
     /// Scroll the viewport down (Alt + h).
@@ -123,8 +129,27 @@ impl KeyMapper {
                 self.alt_on = !self.alt_on;
                 None
             }
-            '\x08' => Some(KeyEvent::Backspace),
-            '\n' => Some(KeyEvent::Enter),
+            '\x08' => {
+                if self.alt_on {
+                    // Alt+Backspace cancels the current operation. Auto-clears
+                    // Alt so the next keystroke isn't accidentally consumed by
+                    // an Alt-action.
+                    self.alt_on = false;
+                    Some(KeyEvent::Cancel)
+                } else {
+                    Some(KeyEvent::Backspace)
+                }
+            }
+            '\n' => {
+                if self.shift_on {
+                    // Shift+Enter: insert newline in buffer; auto-clear Shift
+                    // (only Enter consumes the Shift toggle — letters do not).
+                    self.shift_on = false;
+                    Some(KeyEvent::SoftEnter)
+                } else {
+                    Some(KeyEvent::Enter)
+                }
+            }
             c => {
                 if self.alt_on {
                     match c {
@@ -324,13 +349,70 @@ mod tests {
     }
 
     #[test]
-    fn backspace_and_enter_unaffected_by_modifiers() {
+    fn backspace_unaffected_by_modifiers() {
         let mut km = KeyMapper::new();
         km.process(3, 5, true); // Shift
         km.process(3, 8, true); // Sym
 
         assert_eq!(km.process(1, 9, true), Some(KeyEvent::Backspace));
+    }
+
+    #[test]
+    fn shift_enter_produces_soft_enter_and_clears_shift() {
+        let mut km = KeyMapper::new();
+        km.process(3, 5, true); // Shift on
+        assert!(km.shift_on());
+
+        // Shift+Enter → SoftEnter
+        assert_eq!(km.process(2, 9, true), Some(KeyEvent::SoftEnter));
+        // Shift auto-cleared by Enter
+        assert!(!km.shift_on());
+
+        // Next Enter is a normal Enter
         assert_eq!(km.process(2, 9, true), Some(KeyEvent::Enter));
+    }
+
+    #[test]
+    fn plain_enter_unaffected() {
+        let mut km = KeyMapper::new();
+        assert_eq!(km.process(2, 9, true), Some(KeyEvent::Enter));
+    }
+
+    #[test]
+    fn alt_backspace_produces_cancel_and_clears_alt() {
+        let mut km = KeyMapper::new();
+        // Plain backspace is unchanged
+        assert_eq!(km.process(1, 9, true), Some(KeyEvent::Backspace));
+
+        // Alt on
+        km.process(2, 0, true);
+        assert!(km.alt_on());
+
+        // Alt+Backspace → Cancel
+        assert_eq!(km.process(1, 9, true), Some(KeyEvent::Cancel));
+        // Alt auto-cleared
+        assert!(!km.alt_on());
+
+        // Next backspace is plain again
+        assert_eq!(km.process(1, 9, true), Some(KeyEvent::Backspace));
+    }
+
+    #[test]
+    fn shift_persists_through_letters_then_clears_only_on_enter() {
+        let mut km = KeyMapper::new();
+        km.process(3, 5, true); // Shift on
+        // Letters use shift but do NOT clear it
+        assert_eq!(km.process(0, 0, true), Some(KeyEvent::Char('Q')));
+        assert!(km.shift_on());
+        assert_eq!(km.process(0, 1, true), Some(KeyEvent::Char('W')));
+        assert!(km.shift_on());
+
+        // Shift+Enter clears
+        assert_eq!(km.process(2, 9, true), Some(KeyEvent::SoftEnter));
+        assert!(!km.shift_on());
+
+        // Next letter is lowercase
+        assert_eq!(km.process(0, 0, true), Some(KeyEvent::Char('q')));
     }
 
     #[test]

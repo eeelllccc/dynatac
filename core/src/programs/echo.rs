@@ -10,38 +10,63 @@ pub fn run(args: &[&str], _ctx: &mut ExecContext) -> ProgramResult {
 mod tests {
     use super::*;
 
+    use crate::credentials::MockCredentialStore;
+    use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
     use crate::saved_networks::MockNetworkStore;
     use crate::wifi::MockWifiDriver;
 
+    /// Bundle of mocks needed to construct an [`ExecContext`] in tests.
+    /// Each test stack-allocates this and then borrows fields into the ctx.
+    struct Env {
+        wifi: MockWifiDriver,
+        http: MockHttpClient,
+        saved: MockNetworkStore,
+        smtp: MockSmtpStreamFactory,
+        creds: MockCredentialStore,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            Self {
+                wifi: MockWifiDriver::new(),
+                http: MockHttpClient::new(),
+                saved: MockNetworkStore::new(),
+                smtp: MockSmtpStreamFactory::new(),
+                creds: MockCredentialStore::new(),
+            }
+        }
+        fn ctx(&mut self) -> ExecContext<'_> {
+            ExecContext {
+                uptime_secs: 0,
+                wifi: &mut self.wifi,
+                http: &mut self.http,
+                saved_networks: &mut self.saved,
+                smtp: &mut self.smtp,
+                credentials: &mut self.creds,
+            }
+        }
+    }
+
     #[test]
     fn no_args_prints_empty() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = ExecContext { uptime_secs: 0, wifi: &mut wifi, http: &mut http, saved_networks: &mut saved };
-        let r = run(&[], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&[], &mut env.ctx());
         assert_eq!(r.output, "");
         assert_eq!(r.exit_code, 0);
     }
 
     #[test]
     fn single_arg() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = ExecContext { uptime_secs: 0, wifi: &mut wifi, http: &mut http, saved_networks: &mut saved };
-        let r = run(&["hello"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["hello"], &mut env.ctx());
         assert_eq!(r.output, "hello");
     }
 
     #[test]
     fn multiple_args_joined_with_spaces() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = ExecContext { uptime_secs: 0, wifi: &mut wifi, http: &mut http, saved_networks: &mut saved };
-        let r = run(&["hello", "world"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["hello", "world"], &mut env.ctx());
         assert_eq!(r.output, "hello world");
     }
 }

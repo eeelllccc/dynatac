@@ -52,9 +52,13 @@ impl TextPrompt {
                 }
             }
             KeyEvent::Enter => TextPromptAction::Submitted(self.input.clone()),
-            KeyEvent::ScrollUp | KeyEvent::ScrollDown | KeyEvent::ScrollBottom => {
-                TextPromptAction::None
-            }
+            // Cancel is intercepted by the shell before it ever reaches
+            // the prompt, but we still need an arm so the match is exhaustive.
+            KeyEvent::SoftEnter
+            | KeyEvent::Cancel
+            | KeyEvent::ScrollUp
+            | KeyEvent::ScrollDown
+            | KeyEvent::ScrollBottom => TextPromptAction::None,
         }
     }
 

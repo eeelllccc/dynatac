@@ -16,54 +16,66 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::MockCredentialStore;
+    use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
     use crate::saved_networks::MockNetworkStore;
     use crate::wifi::MockWifiDriver;
 
-    fn make_ctx<'a>(
-        wifi: &'a mut dyn crate::wifi::WifiDriver,
-        http: &'a mut dyn crate::http::HttpClient,
-        saved: &'a mut dyn crate::saved_networks::NetworkStore,
-    ) -> ExecContext<'a> {
-        ExecContext {
-            uptime_secs: 0,
-            wifi,
-            http,
-            saved_networks: saved,
+    struct Env {
+        wifi: MockWifiDriver,
+        http: MockHttpClient,
+        saved: MockNetworkStore,
+        smtp: MockSmtpStreamFactory,
+        creds: MockCredentialStore,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            Self {
+                wifi: MockWifiDriver::new(),
+                http: MockHttpClient::new(),
+                saved: MockNetworkStore::new(),
+                smtp: MockSmtpStreamFactory::new(),
+                creds: MockCredentialStore::new(),
+            }
+        }
+        fn ctx(&mut self) -> ExecContext<'_> {
+            ExecContext {
+                uptime_secs: 0,
+                wifi: &mut self.wifi,
+                http: &mut self.http,
+                saved_networks: &mut self.saved,
+                smtp: &mut self.smtp,
+                credentials: &mut self.creds,
+            }
         }
     }
 
     #[test]
     fn no_args_shows_usage() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&[], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&[], &mut env.ctx());
         assert_eq!(r.exit_code, 1);
         assert!(r.output.contains("usage"));
     }
 
     #[test]
     fn successful_get() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        http.on_get("http://example.com", Ok("<html>hello</html>".into()));
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["http://example.com"], &mut ctx);
+        let mut env = Env::new();
+        env.http
+            .on_get("http://example.com", Ok("<html>hello</html>".into()));
+        let r = run(&["http://example.com"], &mut env.ctx());
         assert_eq!(r.exit_code, 0);
         assert_eq!(r.output, "<html>hello</html>");
     }
 
     #[test]
     fn failed_get() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        http.on_get("http://fail.com", Err("connection refused".into()));
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["http://fail.com"], &mut ctx);
+        let mut env = Env::new();
+        env.http
+            .on_get("http://fail.com", Err("connection refused".into()));
+        let r = run(&["http://fail.com"], &mut env.ctx());
         assert_eq!(r.exit_code, 1);
         assert!(r.output.contains("connection refused"));
     }

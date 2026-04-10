@@ -79,6 +79,27 @@ impl Terminal {
                 self.cursor += 1;
                 TerminalAction::Redraw
             }
+            KeyEvent::SoftEnter => {
+                // Insert a literal newline at the cursor; the input parser
+                // will treat it as whitespace outside quotes and as a
+                // literal newline inside quoted strings.
+                self.input.insert(self.cursor, '\n');
+                self.cursor += 1;
+                TerminalAction::Redraw
+            }
+            KeyEvent::Cancel => {
+                // Alt+Backspace at the regular prompt: discard whatever
+                // the user has typed so far and reset the cursor. (In
+                // interactive list / text-prompt mode, the shell intercepts
+                // Cancel and never forwards it here.)
+                if self.input.is_empty() {
+                    TerminalAction::None
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                    TerminalAction::Redraw
+                }
+            }
             KeyEvent::Backspace => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -90,9 +111,16 @@ impl Terminal {
             }
             KeyEvent::Enter => {
                 let cmd = self.input.clone();
-                // Record the prompt+command in scrollback
-                let submitted = format!("{}{}", self.prompt, cmd);
-                self.lines.push(submitted);
+                // Record the prompt+command in scrollback. Multi-line input
+                // (from Shift+Enter) is split so each segment becomes its own
+                // scrollback line; the prompt prefixes only the first segment.
+                for (i, segment) in cmd.split('\n').enumerate() {
+                    if i == 0 {
+                        self.lines.push(format!("{}{}", self.prompt, segment));
+                    } else {
+                        self.lines.push(segment.to_string());
+                    }
+                }
                 self.input.clear();
                 self.cursor = 0;
                 self.scroll_offset = 0;
@@ -143,14 +171,38 @@ impl Terminal {
         output_wrapped
     }
 
+    /// Build the wrapped rows that make up the input area.
+    ///
+    /// The input may contain literal newlines (from Shift+Enter). The prompt
+    /// is shown only on the first line; continuation lines have no prefix.
+    /// The cursor (`_`) is appended at the end of the last segment, which is
+    /// always where new characters are inserted.
+    fn wrap_input_lines(&self) -> Vec<String> {
+        if !self.show_input {
+            return Vec::new();
+        }
+        let segments: Vec<&str> = self.input.split('\n').collect();
+        let last = segments.len() - 1;
+        let mut wrapped: Vec<String> = Vec::new();
+        for (i, seg) in segments.iter().enumerate() {
+            let mut row = String::new();
+            if i == 0 {
+                row.push_str(&self.prompt);
+            }
+            row.push_str(seg);
+            if i == last {
+                row.push('_');
+            }
+            for chunk in wrap(&row, self.cols) {
+                wrapped.push(chunk);
+            }
+        }
+        wrapped
+    }
+
     /// How many rows the input line occupies.
     fn input_row_count(&self) -> usize {
-        if self.show_input {
-            let input_display = format!("{}{}_", self.prompt, self.input);
-            wrap(&input_display, self.cols).len().min(self.rows)
-        } else {
-            0
-        }
+        self.wrap_input_lines().len().min(self.rows)
     }
 
     /// Maximum scroll offset (how far up from the bottom you can scroll).
@@ -166,18 +218,11 @@ impl Terminal {
     /// cursor) occupies the bottom rows, and scrollback output fills above it.
     pub fn render(&self) -> Vec<RenderCell> {
         let mut cells = Vec::new();
-        let cols = self.cols;
         let rows = self.rows;
 
         // When input is hidden, all rows go to output.
-        let (input_wrapped, input_row_count) = if self.show_input {
-            let input_display = format!("{}{}_", self.prompt, self.input);
-            let wrapped = wrap(&input_display, cols);
-            let count = wrapped.len().min(rows);
-            (wrapped, count)
-        } else {
-            (Vec::new(), 0)
-        };
+        let input_wrapped = self.wrap_input_lines();
+        let input_row_count = input_wrapped.len().min(rows);
         let rows_for_output = rows.saturating_sub(input_row_count);
 
         let output_wrapped = self.wrapped_output();
@@ -542,5 +587,118 @@ mod tests {
         term.handle_key(KeyEvent::ScrollDown);
         let cells = term.render();
         assert_eq!(row_text(&cells, (R - 2) as u8), "hello");
+    }
+
+    // --- SoftEnter / multi-line input tests ---
+
+    #[test]
+    fn softenter_inserts_newline_in_buffer() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Char('a'));
+        assert_eq!(term.handle_key(KeyEvent::SoftEnter), TerminalAction::Redraw);
+        term.handle_key(KeyEvent::Char('b'));
+        // Buffer should be "a\nb" — visible as two rows.
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "> a");
+        assert_eq!(row_text(&cells, (R - 1) as u8), "b_");
+    }
+
+    #[test]
+    fn multiline_input_no_continuation_prompt() {
+        let mut term = term();
+        for ch in "foo".chars() {
+            term.handle_key(KeyEvent::Char(ch));
+        }
+        term.handle_key(KeyEvent::SoftEnter);
+        for ch in "bar".chars() {
+            term.handle_key(KeyEvent::Char(ch));
+        }
+        let cells = term.render();
+        // First row carries the prompt, second row does NOT.
+        assert_eq!(row_text(&cells, (R - 2) as u8), "> foo");
+        assert_eq!(row_text(&cells, (R - 1) as u8), "bar_");
+    }
+
+    #[test]
+    fn backspace_at_start_of_continuation_merges_rows() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Char('a'));
+        term.handle_key(KeyEvent::SoftEnter);
+        // Cursor is now at start of second row. Backspace removes the \n.
+        assert_eq!(term.handle_key(KeyEvent::Backspace), TerminalAction::Redraw);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> a_");
+    }
+
+    #[test]
+    fn enter_after_softenter_submits_full_buffer_with_newlines() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Char('a'));
+        term.handle_key(KeyEvent::SoftEnter);
+        term.handle_key(KeyEvent::Char('b'));
+        let action = term.handle_key(KeyEvent::Enter);
+        assert_eq!(action, TerminalAction::Execute("a\nb".into()));
+
+        // Scrollback shows the multi-line command across two lines:
+        // prompt prefixes only the first segment.
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+        assert_eq!(row_text(&cells, (R - 2) as u8), "b");
+        assert_eq!(row_text(&cells, (R - 3) as u8), "> a");
+    }
+
+    #[test]
+    fn empty_first_segment_renders_prompt_only_row() {
+        let mut term = term();
+        // Shift+Enter on an empty line: buffer becomes "\n", first segment empty.
+        term.handle_key(KeyEvent::SoftEnter);
+        term.handle_key(KeyEvent::Char('x'));
+        let cells = term.render();
+        // First row is just the prompt; second row is "x" + cursor.
+        assert_eq!(row_text(&cells, (R - 2) as u8), "> ");
+        assert_eq!(row_text(&cells, (R - 1) as u8), "x_");
+    }
+
+    #[test]
+    fn cancel_clears_input_buffer() {
+        let mut term = term();
+        for ch in "hello world".chars() {
+            term.handle_key(KeyEvent::Char(ch));
+        }
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::Redraw);
+        let cells = term.render();
+        // Input is gone, prompt + cursor remain.
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+    }
+
+    #[test]
+    fn cancel_clears_multiline_input() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Char('a'));
+        term.handle_key(KeyEvent::SoftEnter);
+        term.handle_key(KeyEvent::Char('b'));
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::Redraw);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+    }
+
+    #[test]
+    fn cancel_on_empty_input_is_none() {
+        let mut term = term();
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+    }
+
+    #[test]
+    fn three_line_input_renders_three_rows() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Char('1'));
+        term.handle_key(KeyEvent::SoftEnter);
+        term.handle_key(KeyEvent::Char('2'));
+        term.handle_key(KeyEvent::SoftEnter);
+        term.handle_key(KeyEvent::Char('3'));
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 3) as u8), "> 1");
+        assert_eq!(row_text(&cells, (R - 2) as u8), "2");
+        assert_eq!(row_text(&cells, (R - 1) as u8), "3_");
     }
 }

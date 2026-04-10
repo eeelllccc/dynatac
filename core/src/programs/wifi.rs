@@ -110,67 +110,76 @@ fn forget(ctx: &mut ExecContext) -> ProgramResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::MockCredentialStore;
+    use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
     use crate::saved_networks::{MockNetworkStore, NetworkStore};
     use crate::wifi::{MockWifiDriver, WifiDriver};
 
-    fn make_ctx<'a>(
-        wifi: &'a mut dyn crate::wifi::WifiDriver,
-        http: &'a mut dyn crate::http::HttpClient,
-        saved: &'a mut dyn crate::saved_networks::NetworkStore,
-    ) -> ExecContext<'a> {
-        ExecContext { uptime_secs: 0, wifi, http, saved_networks: saved }
+    struct Env {
+        wifi: MockWifiDriver,
+        http: MockHttpClient,
+        saved: MockNetworkStore,
+        smtp: MockSmtpStreamFactory,
+        creds: MockCredentialStore,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            Self {
+                wifi: MockWifiDriver::new(),
+                http: MockHttpClient::new(),
+                saved: MockNetworkStore::new(),
+                smtp: MockSmtpStreamFactory::new(),
+                creds: MockCredentialStore::new(),
+            }
+        }
+        fn ctx(&mut self) -> ExecContext<'_> {
+            ExecContext {
+                uptime_secs: 0,
+                wifi: &mut self.wifi,
+                http: &mut self.http,
+                saved_networks: &mut self.saved,
+                smtp: &mut self.smtp,
+                credentials: &mut self.creds,
+            }
+        }
     }
 
     #[test]
     fn no_args_shows_usage() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&[], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&[], &mut env.ctx());
         assert!(r.output.contains("usage:"));
     }
 
     #[test]
     fn unknown_subcommand() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["foo"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["foo"], &mut env.ctx());
         assert_eq!(r.exit_code, 1);
         assert!(r.output.contains("unknown subcommand"));
     }
 
     #[test]
     fn status_when_disconnected() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["status"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["status"], &mut env.ctx());
         assert_eq!(r.output, "not connected");
     }
 
     #[test]
     fn status_when_connected() {
-        let mut wifi = MockWifiDriver::new();
-        wifi.connect("home_wifi", "").unwrap();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["status"], &mut ctx);
+        let mut env = Env::new();
+        env.wifi.connect("home_wifi", "").unwrap();
+        let r = run(&["status"], &mut env.ctx());
         assert_eq!(r.output, "connected to home_wifi");
     }
 
     #[test]
     fn connect_returns_start_list_with_context() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["connect"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["connect"], &mut env.ctx());
         let lines: Vec<&str> = r.output.lines().collect();
         assert_eq!(lines[0], "__START_LIST__");
         assert_eq!(lines[1], "connect");
@@ -180,23 +189,17 @@ mod tests {
 
     #[test]
     fn disconnect_when_connected() {
-        let mut wifi = MockWifiDriver::new();
-        wifi.connect("home_wifi", "").unwrap();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["disconnect"], &mut ctx);
+        let mut env = Env::new();
+        env.wifi.connect("home_wifi", "").unwrap();
+        let r = run(&["disconnect"], &mut env.ctx());
         assert_eq!(r.output, "disconnected");
         assert_eq!(r.exit_code, 0);
     }
 
     #[test]
     fn disconnect_when_not_connected() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["disconnect"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["disconnect"], &mut env.ctx());
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.output, "not connected");
     }
@@ -205,11 +208,8 @@ mod tests {
 
     #[test]
     fn on_list_select_connect_prompts_when_no_saved_password() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = on_list_select("connect", "coffee_shop", &mut ctx);
+        let mut env = Env::new();
+        let r = on_list_select("connect", "coffee_shop", &mut env.ctx());
         assert!(r.output.starts_with("__START_TEXT_PROMPT__"));
         assert!(r.output.contains("coffee_shop"));
         assert!(r.output.contains("password:"));
@@ -217,12 +217,9 @@ mod tests {
 
     #[test]
     fn on_list_select_connect_auto_connects_with_saved_password() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        saved.save("coffee_shop", "secret");
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = on_list_select("connect", "coffee_shop", &mut ctx);
+        let mut env = Env::new();
+        env.saved.save("coffee_shop", "secret");
+        let r = on_list_select("connect", "coffee_shop", &mut env.ctx());
         assert_eq!(r.output, "connected to coffee_shop");
         assert_eq!(r.exit_code, 0);
     }
@@ -231,51 +228,39 @@ mod tests {
 
     #[test]
     fn on_list_select_forget_deletes_credentials() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        saved.save("home_wifi", "pass");
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = on_list_select("forget", "home_wifi", &mut ctx);
+        let mut env = Env::new();
+        env.saved.save("home_wifi", "pass");
+        let r = on_list_select("forget", "home_wifi", &mut env.ctx());
         assert_eq!(r.output, "forgot home_wifi");
-        assert_eq!(ctx.saved_networks.load("home_wifi"), None);
+        assert_eq!(env.saved.load("home_wifi"), None);
     }
 
     // --- on_text_submit ---
 
     #[test]
     fn on_text_submit_connects_and_saves() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = on_text_submit("coffee_shop", "secret", &mut ctx);
+        let mut env = Env::new();
+        let r = on_text_submit("coffee_shop", "secret", &mut env.ctx());
         assert_eq!(r.output, "connected to coffee_shop");
         assert_eq!(r.exit_code, 0);
-        assert_eq!(ctx.saved_networks.load("coffee_shop"), Some("secret".to_string()));
+        assert_eq!(env.saved.load("coffee_shop"), Some("secret".to_string()));
     }
 
     #[test]
     fn on_text_submit_does_not_save_on_failure() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = on_text_submit("doesnt_exist", "secret", &mut ctx);
+        let mut env = Env::new();
+        let r = on_text_submit("doesnt_exist", "secret", &mut env.ctx());
         assert_eq!(r.exit_code, 1);
-        assert_eq!(ctx.saved_networks.load("doesnt_exist"), None);
+        assert_eq!(env.saved.load("doesnt_exist"), None);
     }
 
     // --- wifi forget ---
 
     #[test]
     fn forget_lists_saved_networks() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        saved.save("home_wifi", "pass");
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["forget"], &mut ctx);
+        let mut env = Env::new();
+        env.saved.save("home_wifi", "pass");
+        let r = run(&["forget"], &mut env.ctx());
         let lines: Vec<&str> = r.output.lines().collect();
         assert_eq!(lines[0], "__START_LIST__");
         assert_eq!(lines[1], "forget");
@@ -285,11 +270,8 @@ mod tests {
 
     #[test]
     fn forget_with_no_saved_networks_errors() {
-        let mut wifi = MockWifiDriver::new();
-        let mut http = MockHttpClient::new();
-        let mut saved = MockNetworkStore::new();
-        let mut ctx = make_ctx(&mut wifi, &mut http, &mut saved);
-        let r = run(&["forget"], &mut ctx);
+        let mut env = Env::new();
+        let r = run(&["forget"], &mut env.ctx());
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.output, "no saved networks");
     }

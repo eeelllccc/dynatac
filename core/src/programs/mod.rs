@@ -3,12 +3,15 @@
 //! Each program is a function `fn(&[&str], &mut ExecContext) -> ProgramResult`.
 //! Programs live in their own submodules and are registered in [`PROGRAMS`].
 
+use crate::credentials::CredentialStore;
+use crate::email::SmtpStreamFactory;
 use crate::http::HttpClient;
 use crate::saved_networks::NetworkStore;
 use crate::wifi::WifiDriver;
 
 pub mod curl;
 pub mod echo;
+pub mod email;
 pub mod wifi;
 
 /// Ambient state available to every program (clock, drivers, etc.).
@@ -17,6 +20,8 @@ pub struct ExecContext<'a> {
     pub wifi: &'a mut dyn WifiDriver,
     pub http: &'a mut dyn HttpClient,
     pub saved_networks: &'a mut dyn NetworkStore,
+    pub smtp: &'a mut dyn SmtpStreamFactory,
+    pub credentials: &'a mut dyn CredentialStore,
 }
 
 /// The result of running a program.
@@ -72,6 +77,13 @@ pub static PROGRAMS: &[Program] = &[
         run: echo::run,
         on_list_select: None,
         on_text_submit: None,
+    },
+    Program {
+        name: "email",
+        usage: "email <to> \"<subject>\" \"<body>\" | email setup",
+        run: email::run,
+        on_list_select: None,
+        on_text_submit: Some(email::on_text_submit),
     },
     Program {
         name: "wifi",
