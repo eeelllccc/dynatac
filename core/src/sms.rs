@@ -219,13 +219,19 @@ fn validate_body(body: &str) -> Result<(), SmsError> {
 /// ```
 /// repeated for each message. Bodies are taken as the single line
 /// immediately following each header.
+///
+/// **Empty bodies:** if the next line is itself a `+CMGL:` header (which
+/// means this message had an empty body, since the AT layer collapses
+/// blank lines), the body is left as `""` and the next header is not
+/// consumed. Without this guard, an empty-body message would swallow the
+/// next message's header and misreport it as its own body.
 pub fn parse_inbox(lines: &[String]) -> Vec<SmsMessage> {
     let mut messages = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if let Some(partial) = parse_header(&lines[i], "+CMGL:") {
             i += 1;
-            let body = if i < lines.len() {
+            let body = if i < lines.len() && parse_header(&lines[i], "+CMGL:").is_none() {
                 let b = lines[i].clone();
                 i += 1;
                 b
@@ -488,6 +494,49 @@ mod tests {
         // be misinterpreted as a body.
         let lines = vec!["random noise".to_string()];
         assert!(parse_inbox(&lines).is_empty());
+    }
+
+    #[test]
+    fn parse_inbox_empty_body_does_not_swallow_next_header() {
+        // The real bug: message 1 had an empty body (the AT layer
+        // collapsed the blank line), so the lines we see are
+        // [header1, header2, body2]. Without the guard, header2 would
+        // be consumed as message 1's body and message 2 would vanish.
+        let lines = vec![
+            "+CMGL: 1,\"REC READ\",\"+447123\",,\"24/01/01,12:00:00+00\"".to_string(),
+            "+CMGL: 2,\"REC READ\",\"+447987\",,\"24/01/02,09:00:00+00\"".to_string(),
+            "real body".to_string(),
+        ];
+        let msgs = parse_inbox(&lines);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].index, 1);
+        assert_eq!(msgs[0].body, "", "first message should have empty body");
+        assert_eq!(msgs[1].index, 2);
+        assert_eq!(msgs[1].body, "real body");
+    }
+
+    #[test]
+    fn parse_inbox_trailing_empty_body() {
+        // Empty body on the last message — no next line at all.
+        let lines = vec![
+            "+CMGL: 1,\"REC READ\",\"+447\",,\"24/01/01,12:00:00+00\"".to_string(),
+            "first body".to_string(),
+            "+CMGL: 2,\"REC READ\",\"+447\",,\"24/01/02,09:00:00+00\"".to_string(),
+        ];
+        let msgs = parse_inbox(&lines);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].body, "first body");
+        assert_eq!(msgs[1].body, "");
+    }
+
+    #[test]
+    fn parse_inbox_single_empty_body() {
+        let lines = vec![
+            "+CMGL: 1,\"REC READ\",\"+447\",,\"24/01/01,12:00:00+00\"".to_string(),
+        ];
+        let msgs = parse_inbox(&lines);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "");
     }
 
     // --- parse_cmgr ----------------------------------------------------------
