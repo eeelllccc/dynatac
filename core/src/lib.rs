@@ -4,6 +4,7 @@ pub mod framebuffer;
 pub mod http;
 pub mod keymap;
 pub mod list_selector;
+pub mod modem;
 pub mod programs;
 pub mod saved_networks;
 pub mod shell;

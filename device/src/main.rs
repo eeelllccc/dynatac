@@ -1,6 +1,7 @@
 mod display;
 mod http;
 pub mod keyboard;
+mod modem;
 mod nvs_credential_store;
 mod nvs_network_store;
 mod smtp;
@@ -14,6 +15,7 @@ use esp_idf_svc::hal::{
     i2c::{I2cConfig, I2cDriver},
     peripherals::Peripherals,
     spi::{config::DriverConfig, SpiConfig, SpiDeviceDriver, SpiDriver},
+    uart::{config::Config as UartConfig, UartDriver},
     units::Hertz,
 };
 
@@ -24,6 +26,7 @@ use dynatac_core::terminal::{Terminal, TerminalAction};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use http::EspHttpClient;
+use modem::EspA7682EModem;
 use nvs_credential_store::NvsCredentialStore;
 use nvs_network_store::NvsNetworkStore;
 use smtp::EspSmtpStreamFactory;
@@ -97,6 +100,26 @@ fn main() {
     let mut credentials = NvsCredentialStore::new(nvs);
     let mut smtp_factory = EspSmtpStreamFactory::new();
 
+    // --- A7682E 4G modem (off by default; powered on by `modem on`) ---------
+    // Board pin map (from T-Deck-Pro utilities.h):
+    //   POWER_EN = GPIO41, PWRKEY = GPIO40,
+    //   modem RX = GPIO10 (ESP TX), modem TX = GPIO11 (ESP RX).
+    // UART1 is free (UART0 is the USB console, the main ESP wifi/BT peripheral
+    // used elsewhere is unrelated to the hardware UARTs).
+    let uart_config = UartConfig::new().baudrate(Hertz(115_200));
+    let modem_uart = UartDriver::new(
+        peripherals.uart1,
+        pins.gpio10,
+        pins.gpio11,
+        None::<esp_idf_svc::hal::gpio::AnyIOPin>,
+        None::<esp_idf_svc::hal::gpio::AnyIOPin>,
+        &uart_config,
+    )
+    .unwrap();
+    let modem_pwrkey = PinDriver::output(pins.gpio40.downgrade_output()).unwrap();
+    let modem_power_en = PinDriver::output(pins.gpio41.downgrade_output()).unwrap();
+    let mut modem_driver = EspA7682EModem::new(modem_uart, modem_pwrkey, modem_power_en);
+
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");
     epd.clear().unwrap();
@@ -133,6 +156,7 @@ fn main() {
                             saved_networks: &mut saved_networks,
                             smtp: &mut smtp_factory,
                             credentials: &mut credentials,
+                            modem: &mut modem_driver,
                         };
                         let was_interactive = true;
                         match shell.handle_interactive_key(event, &mut ctx) {
@@ -165,6 +189,7 @@ fn main() {
                                     saved_networks: &mut saved_networks,
                                     smtp: &mut smtp_factory,
                                     credentials: &mut credentials,
+                                    modem: &mut modem_driver,
                                 };
                                 match shell.execute(&cmd, &mut ctx) {
                                     ShellAction::Output(output) => {

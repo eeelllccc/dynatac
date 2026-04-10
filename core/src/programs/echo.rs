@@ -13,6 +13,7 @@ mod tests {
     use crate::credentials::MockCredentialStore;
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
+    use crate::modem::MockModem;
     use crate::saved_networks::MockNetworkStore;
     use crate::wifi::MockWifiDriver;
 
@@ -24,6 +25,7 @@ mod tests {
         saved: MockNetworkStore,
         smtp: MockSmtpStreamFactory,
         creds: MockCredentialStore,
+        modem: MockModem,
     }
 
     impl Env {
@@ -34,6 +36,7 @@ mod tests {
                 saved: MockNetworkStore::new(),
                 smtp: MockSmtpStreamFactory::new(),
                 creds: MockCredentialStore::new(),
+                modem: MockModem::new(),
             }
         }
         fn ctx(&mut self) -> ExecContext<'_> {
@@ -44,6 +47,7 @@ mod tests {
                 saved_networks: &mut self.saved,
                 smtp: &mut self.smtp,
                 credentials: &mut self.creds,
+                modem: &mut self.modem,
             }
         }
     }

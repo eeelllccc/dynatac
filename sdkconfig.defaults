@@ -8,3 +8,12 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
 # Workaround for https://github.com/espressif/esp-idf/issues/7631
 #CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 #CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=n
+
+# PPP support for the A7682E 4G modem (used in a future data-mode step).
+# Enabled now so the binary layout is stable and the feature is available
+# without a later config flip. The esp-idf-svc PPP netif wrapper requires
+# NOTIFY_PHASE_SUPPORT. PAP/CHAP cover the common cellular auth methods.
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_CHAP_SUPPORT=y

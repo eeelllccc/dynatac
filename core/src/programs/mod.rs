@@ -6,12 +6,14 @@
 use crate::credentials::CredentialStore;
 use crate::email::SmtpStreamFactory;
 use crate::http::HttpClient;
+use crate::modem::Modem;
 use crate::saved_networks::NetworkStore;
 use crate::wifi::WifiDriver;
 
 pub mod curl;
 pub mod echo;
 pub mod email;
+pub mod modem;
 pub mod wifi;
 
 /// Ambient state available to every program (clock, drivers, etc.).
@@ -22,6 +24,7 @@ pub struct ExecContext<'a> {
     pub saved_networks: &'a mut dyn NetworkStore,
     pub smtp: &'a mut dyn SmtpStreamFactory,
     pub credentials: &'a mut dyn CredentialStore,
+    pub modem: &'a mut dyn Modem,
 }
 
 /// The result of running a program.
@@ -84,6 +87,13 @@ pub static PROGRAMS: &[Program] = &[
         run: email::run,
         on_list_select: None,
         on_text_submit: Some(email::on_text_submit),
+    },
+    Program {
+        name: "modem",
+        usage: "modem [status|on|off|at <cmd>]",
+        run: modem::run,
+        on_list_select: None,
+        on_text_submit: None,
     },
     Program {
         name: "wifi",
