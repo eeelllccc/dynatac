@@ -146,6 +146,10 @@ pub enum ModemError {
     CmsError(i32),
     /// An operation was attempted while the modem was powered off.
     NotPowered,
+    /// An AT-command or SMS operation was attempted while a data
+    /// session is active. The modem's UART is currently owned by the
+    /// PPP stack — call `disable_data` first to reclaim command mode.
+    DataActive,
 }
 
 impl ModemError {
@@ -158,6 +162,7 @@ impl ModemError {
             ModemError::CmeError(c) => format!("CME ERROR {}", c),
             ModemError::CmsError(c) => format!("CMS ERROR {}", c),
             ModemError::NotPowered => "modem is off".to_string(),
+            ModemError::DataActive => "modem is in data mode".to_string(),
         }
     }
 }
@@ -190,6 +195,21 @@ pub trait Modem {
     /// `send_raw` (e.g. 60 s) since over-the-air SMS delivery can be
     /// slow on weak signal.
     fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError>;
+    /// Bring up a cellular data session using the given APN. Blocks
+    /// until either the PPP link has an IP address or the bring-up
+    /// times out. Requires the modem to be powered on and (ideally)
+    /// registered to a network — the caller should verify registration
+    /// separately if that matters.
+    ///
+    /// While a data session is active, `send_raw` and `send_with_body`
+    /// return [`ModemError::DataActive`] — the UART is owned by the
+    /// PPP stack. Call `disable_data` to return to command mode.
+    fn enable_data(&mut self, apn: &str) -> Result<(), ModemError>;
+    /// Tear down an active data session, returning the modem to
+    /// command mode. No-op if not currently in data mode.
+    fn disable_data(&mut self) -> Result<(), ModemError>;
+    /// Whether a data session is currently active.
+    fn is_data_active(&self) -> bool;
 }
 
 /// In-memory test double for [`Modem`].
@@ -205,6 +225,13 @@ pub struct MockModem {
     status: ModemStatus,
     raw_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
     body_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
+    data_active: bool,
+    /// APN passed to the last successful `enable_data` call, for test
+    /// assertions. `None` if data has never been enabled.
+    pub last_apn: Option<String>,
+    /// Forced error for the next `enable_data` call, to simulate modem
+    /// failures. Consumed on use.
+    pub enable_data_error: Option<ModemError>,
     /// All commands sent via `send_raw`, in order.
     pub raw_log: Vec<String>,
     /// All `(cmd, body)` pairs sent via `send_with_body`, in order.
@@ -223,6 +250,9 @@ impl MockModem {
             },
             raw_responses: std::collections::HashMap::new(),
             body_responses: std::collections::HashMap::new(),
+            data_active: false,
+            last_apn: None,
+            enable_data_error: None,
             raw_log: Vec::new(),
             body_log: Vec::new(),
         }
@@ -281,6 +311,9 @@ impl Modem for MockModem {
         if !self.powered {
             return Err(ModemError::NotPowered);
         }
+        if self.data_active {
+            return Err(ModemError::DataActive);
+        }
         self.raw_log.push(cmd.to_string());
         match self.raw_responses.get(cmd) {
             Some(r) => r.clone(),
@@ -292,11 +325,35 @@ impl Modem for MockModem {
         if !self.powered {
             return Err(ModemError::NotPowered);
         }
+        if self.data_active {
+            return Err(ModemError::DataActive);
+        }
         self.body_log.push((cmd.to_string(), body.to_vec()));
         match self.body_responses.get(cmd) {
             Some(r) => r.clone(),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn enable_data(&mut self, apn: &str) -> Result<(), ModemError> {
+        if !self.powered {
+            return Err(ModemError::NotPowered);
+        }
+        if let Some(err) = self.enable_data_error.take() {
+            return Err(err);
+        }
+        self.data_active = true;
+        self.last_apn = Some(apn.to_string());
+        Ok(())
+    }
+
+    fn disable_data(&mut self) -> Result<(), ModemError> {
+        self.data_active = false;
+        Ok(())
+    }
+
+    fn is_data_active(&self) -> bool {
+        self.data_active
     }
 }
 
@@ -462,6 +519,69 @@ mod tests {
         let mut m = MockModem::new();
         m.power_on().unwrap();
         assert_eq!(m.send_raw("AT").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mock_enable_data_requires_power() {
+        let mut m = MockModem::new();
+        assert_eq!(m.enable_data("everywhere").unwrap_err(), ModemError::NotPowered);
+    }
+
+    #[test]
+    fn mock_enable_data_sets_active_and_records_apn() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        assert!(!m.is_data_active());
+        m.enable_data("everywhere").unwrap();
+        assert!(m.is_data_active());
+        assert_eq!(m.last_apn.as_deref(), Some("everywhere"));
+    }
+
+    #[test]
+    fn mock_enable_data_honors_scripted_error() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.enable_data_error = Some(ModemError::Timeout);
+        assert_eq!(m.enable_data("everywhere").unwrap_err(), ModemError::Timeout);
+        assert!(!m.is_data_active());
+    }
+
+    #[test]
+    fn mock_send_raw_errors_while_data_active() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.enable_data("everywhere").unwrap();
+        assert_eq!(m.send_raw("AT").unwrap_err(), ModemError::DataActive);
+    }
+
+    #[test]
+    fn mock_send_with_body_errors_while_data_active() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.enable_data("everywhere").unwrap();
+        assert_eq!(
+            m.send_with_body("AT+CMGS=\"+1\"", b"x").unwrap_err(),
+            ModemError::DataActive
+        );
+    }
+
+    #[test]
+    fn mock_disable_data_returns_to_command_mode() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.enable_data("everywhere").unwrap();
+        m.disable_data().unwrap();
+        assert!(!m.is_data_active());
+        // AT commands work again.
+        assert!(m.send_raw("AT").is_ok());
+    }
+
+    #[test]
+    fn mock_disable_data_is_idempotent() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        // Never called enable_data — disable_data should still be Ok.
+        assert!(m.disable_data().is_ok());
     }
 
     #[test]

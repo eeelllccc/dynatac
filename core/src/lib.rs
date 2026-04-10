@@ -5,6 +5,7 @@ pub mod http;
 pub mod keymap;
 pub mod list_selector;
 pub mod modem;
+pub mod network;
 pub mod programs;
 pub mod sms;
 pub mod saved_networks;

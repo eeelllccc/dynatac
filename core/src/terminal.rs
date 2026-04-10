@@ -18,6 +18,8 @@ use crate::keymap::KeyEvent;
 pub const COLS: usize = 30;
 pub const ROWS: usize = 32;
 
+const HISTORY_MAX: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCell {
     pub col: u8,
@@ -44,6 +46,11 @@ pub struct Terminal {
     prompt: String,
     show_input: bool,
     scroll_offset: usize,
+    history: Vec<String>,
+    /// `Some(i)` means the input was loaded from `history[i]` and the user
+    /// is walking history with Cancel. Reset to `None` whenever the input
+    /// is edited or a command is submitted.
+    history_cursor: Option<usize>,
 }
 
 impl Terminal {
@@ -57,6 +64,8 @@ impl Terminal {
             prompt: prompt.to_string(),
             show_input: true,
             scroll_offset: 0,
+            history: Vec::new(),
+            history_cursor: None,
         }
     }
 
@@ -77,6 +86,7 @@ impl Terminal {
             KeyEvent::Char(ch) => {
                 self.input.insert(self.cursor, ch);
                 self.cursor += 1;
+                self.history_cursor = None;
                 TerminalAction::Redraw
             }
             KeyEvent::SoftEnter => {
@@ -85,15 +95,36 @@ impl Terminal {
                 // literal newline inside quoted strings.
                 self.input.insert(self.cursor, '\n');
                 self.cursor += 1;
+                self.history_cursor = None;
                 TerminalAction::Redraw
             }
             KeyEvent::Cancel => {
-                // Alt+Backspace at the regular prompt: discard whatever
-                // the user has typed so far and reset the cursor. (In
-                // interactive list / text-prompt mode, the shell intercepts
-                // Cancel and never forwards it here.)
+                // Alt+Backspace at the regular prompt. Three modes:
+                //   1. Already walking history: walk further back.
+                //   2. Empty input, not walking: start walking from the
+                //      most recent command.
+                //   3. Non-empty input, not walking: clear the input.
+                // (In interactive list / text-prompt mode, the shell
+                // intercepts Cancel and never forwards it here.)
+                if let Some(i) = self.history_cursor {
+                    if i == 0 {
+                        return TerminalAction::None;
+                    }
+                    let next = i - 1;
+                    self.history_cursor = Some(next);
+                    self.input = self.history[next].clone();
+                    self.cursor = self.input.len();
+                    return TerminalAction::Redraw;
+                }
                 if self.input.is_empty() {
-                    TerminalAction::None
+                    if self.history.is_empty() {
+                        return TerminalAction::None;
+                    }
+                    let next = self.history.len() - 1;
+                    self.history_cursor = Some(next);
+                    self.input = self.history[next].clone();
+                    self.cursor = self.input.len();
+                    TerminalAction::Redraw
                 } else {
                     self.input.clear();
                     self.cursor = 0;
@@ -104,6 +135,7 @@ impl Terminal {
                 if self.cursor > 0 {
                     self.cursor -= 1;
                     self.input.remove(self.cursor);
+                    self.history_cursor = None;
                     TerminalAction::Redraw
                 } else {
                     TerminalAction::None
@@ -121,6 +153,13 @@ impl Terminal {
                         self.lines.push(segment.to_string());
                     }
                 }
+                if !cmd.is_empty() && self.history.last() != Some(&cmd) {
+                    self.history.push(cmd.clone());
+                    if self.history.len() > HISTORY_MAX {
+                        self.history.remove(0);
+                    }
+                }
+                self.history_cursor = None;
                 self.input.clear();
                 self.cursor = 0;
                 self.scroll_offset = 0;
@@ -685,6 +724,134 @@ mod tests {
     #[test]
     fn cancel_on_empty_input_is_none() {
         let mut term = term();
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+    }
+
+    // --- History recall tests ---
+
+    fn run(term: &mut Terminal, line: &str) {
+        for ch in line.chars() {
+            term.handle_key(KeyEvent::Char(ch));
+        }
+        term.handle_key(KeyEvent::Enter);
+    }
+
+    #[test]
+    fn alt_backspace_on_empty_with_no_history_is_none() {
+        let mut term = term();
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+    }
+
+    #[test]
+    fn alt_backspace_recalls_last_command() {
+        let mut term = term();
+        run(&mut term, "echo hi");
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::Redraw);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> echo hi_");
+    }
+
+    #[test]
+    fn alt_backspace_walks_history_backward() {
+        let mut term = term();
+        run(&mut term, "first");
+        run(&mut term, "second");
+        run(&mut term, "third");
+
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> third_");
+
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> second_");
+
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> first_");
+    }
+
+    #[test]
+    fn alt_backspace_at_oldest_history_returns_none() {
+        let mut term = term();
+        run(&mut term, "only");
+        term.handle_key(KeyEvent::Cancel); // recalls "only", at oldest
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> only_");
+    }
+
+    #[test]
+    fn enter_on_recalled_command_runs_it() {
+        let mut term = term();
+        run(&mut term, "echo a");
+        term.handle_key(KeyEvent::Cancel);
+        let action = term.handle_key(KeyEvent::Enter);
+        assert_eq!(action, TerminalAction::Execute("echo a".into()));
+    }
+
+    #[test]
+    fn enter_dedupes_consecutive_duplicates() {
+        let mut term = term();
+        run(&mut term, "ls");
+        run(&mut term, "ls");
+        // Only one entry — Cancel recalls it once, second Cancel is None.
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> ls_");
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+    }
+
+    #[test]
+    fn typing_after_recall_exits_history_mode() {
+        let mut term = term();
+        run(&mut term, "older");
+        run(&mut term, "newer");
+        term.handle_key(KeyEvent::Cancel); // input = "newer"
+        term.handle_key(KeyEvent::Char('!')); // edit → exits history mode
+        // Next Cancel is the "non-empty input" branch: clears the input.
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::Redraw);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+        // Then Cancel again recalls the most recent.
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> newer_");
+    }
+
+    #[test]
+    fn backspace_after_recall_exits_history_mode() {
+        let mut term = term();
+        run(&mut term, "older");
+        run(&mut term, "newer");
+        term.handle_key(KeyEvent::Cancel); // input = "newer"
+        term.handle_key(KeyEvent::Backspace); // input = "newe", exits history mode
+        // Next Cancel clears (non-empty branch), not walks back.
+        term.handle_key(KeyEvent::Cancel);
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
+    }
+
+    #[test]
+    fn empty_command_not_added_to_history() {
+        let mut term = term();
+        term.handle_key(KeyEvent::Enter); // bare Enter
+        assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
+    }
+
+    #[test]
+    fn history_capped_at_max() {
+        let mut term = term();
+        for i in 0..(HISTORY_MAX + 10) {
+            run(&mut term, &format!("c{}", i));
+        }
+        // Walking all the way back should hit the oldest retained command,
+        // which is c10 (the first 10 were evicted).
+        for _ in 0..HISTORY_MAX {
+            term.handle_key(KeyEvent::Cancel);
+        }
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 1) as u8), "> c10_");
         assert_eq!(term.handle_key(KeyEvent::Cancel), TerminalAction::None);
     }
 

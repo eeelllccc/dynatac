@@ -1,9 +1,41 @@
 //! Real A7682E (4G LTE) modem driver on UART1.
 //!
-//! Wraps a [`UartDriver`] and the PWRKEY/POWER_EN GPIO pins, implementing
-//! the [`Modem`] trait from `dynatac_core`. The low-level AT byte-stream
-//! parser and line classifier live in `dynatac_core::modem::at` so they
-//! can be tested on the host against recorded fixtures.
+//! Wraps a [`UartDriver`] (shared via [`Arc`] so the PPP data path can
+//! clone it without giving up command-mode access) and the PWRKEY/
+//! POWER_EN GPIO pins. Implements the [`Modem`] trait from
+//! `dynatac_core`.
+//!
+//! The modem has two operational phases:
+//!
+//!   - **Command mode.** `send_raw` / `send_with_body` / `status` work
+//!     normally. The AT parser consumes UART RX bytes synchronously on
+//!     the calling thread.
+//!   - **Data mode.** A PPP session is active (set up by `enable_data`).
+//!     The UART byte stream is owned by lwIP's PPP stack via an
+//!     [`EspNetifDriver`]. AT commands return [`ModemError::DataActive`].
+//!     A dedicated **RX pump thread** (spawned by `enable_data`, joined
+//!     by `disable_data`) is the sole reader of UART RX bytes, feeding
+//!     them into the PPP stack. It also owns the EspNetifDriver outright
+//!     — this sidesteps having to share that type across threads, which
+//!     it isn't designed for. The TX direction is handled by esp-idf's
+//!     own hidden thread invoking the tx closure we gave to
+//!     EspNetifDriver::new.
+//!
+//! # Lifetime workaround
+//!
+//! `std::thread::spawn` requires `'static` closures, but `UartDriver<'d>`
+//! and `EspNetifDriver<'d, _>` carry the peripheral lifetime from
+//! `main()`'s stack. We use `std::mem::transmute` to force-upgrade those
+//! to `'static` at the point of spawning. This is sound because:
+//!
+//!   1. `main()` is an infinite event loop that never returns, so the
+//!      `UartDriver` held by `EspA7682EModem::uart` effectively lives
+//!      for the entire program run.
+//!   2. `disable_data` joins the pump thread before any other cleanup,
+//!      and the thread destructor (triggered by thread exit) drops the
+//!      owned `EspNetifDriver` at that point.
+//!   3. Therefore the thread can never outlive either the `UartDriver`
+//!      or the `EspNetifDriver` it references.
 //!
 //! Driver invariants:
 //!   - On construction, POWER_EN is driven HIGH (module power rail on)
@@ -14,18 +46,19 @@
 //!     modem responds (or times out at 15 s). On success, command echo
 //!     is disabled via `ATE0`.
 //!   - `power_off` runs a 3 s PWRKEY pulse per the T-Deck-Pro example
-//!     and A76xx datasheet.
-//!   - `send_raw` is blocking: it drains any stale UART bytes, writes
-//!     the command + `\r`, then reads bytes into the AT parser until a
-//!     final result code is observed or the 5 s command timeout expires.
-//!     Command echo is automatically discarded. Recognised URCs are
-//!     logged at INFO and otherwise ignored (a proper URC channel is a
-//!     future step).
+//!     and A76xx datasheet. If a data session is active, it is torn
+//!     down first.
+//!   - `enable_data` blocks until either PPP negotiates an IP address
+//!     or a 30 s deadline expires; in the meantime it pumps UART RX
+//!     into the PPP stack so negotiation can make progress.
 //!   - On the T-Deck-Pro, the PWRKEY pin is inverted on-board: driving
 //!     the ESP32 pin HIGH presses the modem's power button, LOW releases
 //!     it. This matches the T-Deck-Pro Arduino examples.
 
-use std::thread::sleep;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dynatac_core::modem::{
@@ -36,6 +69,7 @@ use esp_idf_svc::hal::{
     gpio::{AnyOutputPin, Output, PinDriver},
     uart::UartDriver,
 };
+use esp_idf_svc::netif::{EspNetif, EspNetifDriver, NetifStack, PppConfiguration};
 use esp_idf_svc::sys::ESP_ERR_TIMEOUT;
 
 /// Maximum time to wait for a single command's final result code.
@@ -43,20 +77,22 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time to wait for the modem to become responsive after power-on.
 const POWER_ON_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum time to wait for the `> ` prompt after issuing a body-soliciting
-/// command (e.g. `AT+CMGS`). Modems usually respond within 1–2 s but can
-/// be slower if the SMS subsystem is busy.
+/// command (e.g. `AT+CMGS`).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time to wait for the final result code after writing a body.
-/// SMS over-the-air delivery on a weak signal can take 30+ s, so we
-/// allow a generous budget here.
+/// SMS over-the-air delivery on a weak signal can take 30+ s.
 const SEND_BODY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Per-read blocking tick budget. Small so the outer deadline drives
-/// cancellation; the exact value depends on CONFIG_FREERTOS_HZ but is
-/// only a polling granularity.
+/// Maximum time to wait for the modem's `CONNECT` response after `ATD*99#`.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time to wait for PPP to negotiate an IP address after `CONNECT`.
+const PPP_UP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-read blocking tick budget for AT commands. Small so the outer
+/// deadline drives cancellation; the exact value depends on
+/// CONFIG_FREERTOS_HZ but is only a polling granularity.
 const READ_TICKS: u32 = 10;
 
 pub struct EspA7682EModem<'d> {
-    uart: UartDriver<'d>,
+    uart: Arc<UartDriver<'d>>,
     pwrkey: PinDriver<'d, AnyOutputPin, Output>,
     // Held so the PinDriver outlives the modem and keeps POWER_EN driven
     // HIGH. Dropping it would release the pin and cut module power.
@@ -64,6 +100,43 @@ pub struct EspA7682EModem<'d> {
     power_en: PinDriver<'d, AnyOutputPin, Output>,
     parser: AtParser,
     powered: bool,
+    data_session: Option<DataSession>,
+}
+
+/// Handle to the background RX pump thread. Dropping or calling
+/// `stop_and_join` on this ends the data session and releases the
+/// EspNetifDriver the thread owns (which in turn drops our tx closure
+/// and closes the PPP netif). Construction is in `enable_data`.
+struct DataSession {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Newtype wrapper so we can move an [`EspNetifDriver`] into a
+/// `std::thread::spawn` closure. The driver contains a raw
+/// `*mut esp_netif_obj` pointer which is not `Send` by default, but
+/// esp-idf's netif APIs are designed to be called from any task (the
+/// lwIP tcpip thread, the driver's hidden tx thread, our pump thread,
+/// etc.), so moving the handle across thread boundaries is sound.
+///
+/// We never hand out shared access to the inner driver; the pump
+/// thread is the single owner, so `Sync` is not needed.
+struct SendNetifDriver(EspNetifDriver<'static, EspNetif>);
+
+// SAFETY: see type-level comment above.
+unsafe impl Send for SendNetifDriver {}
+
+impl DataSession {
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            // If the thread panicked, we've already torn down the PPP
+            // session via its destructor — log but don't propagate.
+            if let Err(e) = handle.join() {
+                log::warn!("ppp rx thread panicked: {:?}", e);
+            }
+        }
+    }
 }
 
 impl<'d> EspA7682EModem<'d> {
@@ -74,21 +147,18 @@ impl<'d> EspA7682EModem<'d> {
         mut pwrkey: PinDriver<'d, AnyOutputPin, Output>,
         mut power_en: PinDriver<'d, AnyOutputPin, Output>,
     ) -> Self {
-        // Enable the modem's power rail and ensure PWRKEY is released
-        // (LOW, which on this board means "not pressing" the power key).
         let _ = power_en.set_high();
         let _ = pwrkey.set_low();
         Self {
-            uart,
+            uart: Arc::new(uart),
             pwrkey,
             power_en,
             parser: AtParser::new(),
             powered: false,
+            data_session: None,
         }
     }
 
-    /// Drive PWRKEY HIGH for `hold` (the "press"), bracketed by brief
-    /// LOW states. On this board HIGH = pressing the modem's power key.
     fn pulse_pwrkey(&mut self, hold: Duration) -> Result<(), ModemError> {
         self.pwrkey
             .set_low()
@@ -105,10 +175,6 @@ impl<'d> EspA7682EModem<'d> {
         Ok(())
     }
 
-    /// Discard any bytes sitting in the UART RX buffer. Used before
-    /// sending a command so stale modem chatter (URCs, boot banner)
-    /// doesn't contaminate the response. Capped to avoid spinning
-    /// forever if the modem is actively transmitting.
     fn drain_uart(&mut self) {
         let mut buf = [0u8; 256];
         for _ in 0..16 {
@@ -119,7 +185,6 @@ impl<'d> EspA7682EModem<'d> {
         }
     }
 
-    /// Write a command string followed by the AT terminator `\r`.
     fn write_command(&mut self, cmd: &str) -> Result<(), ModemError> {
         self.uart
             .write(cmd.as_bytes())
@@ -130,8 +195,6 @@ impl<'d> EspA7682EModem<'d> {
         Ok(())
     }
 
-    /// Read bytes, feed the parser, and return when a final result code
-    /// is observed or the deadline passes.
     fn read_until_final(&mut self, deadline: Instant) -> Result<Vec<String>, ModemError> {
         let mut info: Vec<String> = Vec::new();
         let mut buf = [0u8; 256];
@@ -139,11 +202,6 @@ impl<'d> EspA7682EModem<'d> {
             if Instant::now() >= deadline {
                 return Err(ModemError::Timeout);
             }
-            // The UART driver returns ESP_ERR_TIMEOUT when its blocking
-            // read budget elapses with no bytes — that's normal idle on
-            // the AT line, NOT a fatal I/O error. Treat it as "no data,
-            // keep polling" so the outer `deadline` is what cancels.
-            // Any other error code propagates as a real I/O failure.
             let n = match self.uart.read(&mut buf, READ_TICKS) {
                 Ok(n) => n,
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
@@ -155,10 +213,6 @@ impl<'d> EspA7682EModem<'d> {
             for event in self.parser.feed(&buf[..n]) {
                 match event {
                     AtEvent::Prompt => {
-                        // `send_raw` callers shouldn't be using commands
-                        // that solicit a `> ` prompt — those need a
-                        // dedicated path that writes the body + Ctrl-Z.
-                        // Log and keep waiting so we don't hang.
                         log::warn!("unexpected `> ` prompt during send_raw");
                     }
                     AtEvent::Line(line) => match classify(&line) {
@@ -167,12 +221,8 @@ impl<'d> EspA7682EModem<'d> {
                         LineClass::CmeError(c) => return Err(ModemError::CmeError(c)),
                         LineClass::CmsError(c) => return Err(ModemError::CmsError(c)),
                         LineClass::NoCarrier => return Err(ModemError::Error),
-                        LineClass::Urc(urc) => {
-                            log::info!("modem URC: {:?}", urc);
-                        }
-                        LineClass::Echo => {
-                            // Discard command echo.
-                        }
+                        LineClass::Urc(urc) => log::info!("modem URC: {:?}", urc),
+                        LineClass::Echo => {}
                         LineClass::Info => info.push(line),
                     },
                 }
@@ -180,8 +230,6 @@ impl<'d> EspA7682EModem<'d> {
         }
     }
 
-    /// Internal send with an explicit timeout, used by power-on probing
-    /// where we want a shorter per-attempt deadline than the default.
     fn send_raw_with_timeout(
         &mut self,
         cmd: &str,
@@ -190,16 +238,15 @@ impl<'d> EspA7682EModem<'d> {
         if !self.powered {
             return Err(ModemError::NotPowered);
         }
+        if self.data_session.is_some() {
+            return Err(ModemError::DataActive);
+        }
         self.parser.reset();
         self.drain_uart();
         self.write_command(cmd)?;
         self.read_until_final(Instant::now() + timeout)
     }
 
-    /// Read bytes and feed the parser until we observe an `AtEvent::Prompt`
-    /// (the modem's `"> "` request for a body) or the deadline passes.
-    /// Final result codes encountered before the prompt are surfaced as
-    /// errors — they mean the modem rejected the command outright.
     fn read_until_prompt(&mut self, deadline: Instant) -> Result<(), ModemError> {
         let mut buf = [0u8; 256];
         loop {
@@ -223,10 +270,50 @@ impl<'d> EspA7682EModem<'d> {
                         LineClass::CmsError(c) => return Err(ModemError::CmsError(c)),
                         LineClass::NoCarrier => return Err(ModemError::Error),
                         LineClass::Urc(urc) => log::info!("modem URC: {:?}", urc),
-                        // Echo, info, ok before prompt: discard, the
-                        // prompt should arrive next.
                         _ => {}
                     },
+                }
+            }
+        }
+    }
+
+    /// After sending `ATD*99#`, read bytes until we see a line starting
+    /// with `CONNECT` (dial-up succeeded) or a final error code.
+    fn wait_for_connect(&mut self, deadline: Instant) -> Result<(), ModemError> {
+        let mut buf = [0u8; 256];
+        loop {
+            if Instant::now() >= deadline {
+                log::warn!("modem: ATD*99# timed out waiting for CONNECT");
+                return Err(ModemError::Timeout);
+            }
+            let n = match self.uart.read(&mut buf, READ_TICKS) {
+                Ok(n) => n,
+                Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
+                Err(e) => return Err(ModemError::Io(format!("{:?}", e))),
+            };
+            if n == 0 {
+                continue;
+            }
+            for event in self.parser.feed(&buf[..n]) {
+                if let AtEvent::Line(line) = event {
+                    let trimmed = line.trim();
+                    log::info!("modem dial line: {:?}", trimmed);
+                    if trimmed.starts_with("CONNECT") {
+                        log::info!("modem: dial-up {}", trimmed);
+                        return Ok(());
+                    }
+                    match classify(&line) {
+                        LineClass::Error | LineClass::NoCarrier => {
+                            log::warn!("modem: dial-up rejected: {}", trimmed);
+                            return Err(ModemError::Error);
+                        }
+                        LineClass::CmeError(c) => {
+                            log::warn!("modem: dial-up +CME ERROR {}", c);
+                            return Err(ModemError::CmeError(c));
+                        }
+                        LineClass::CmsError(c) => return Err(ModemError::CmsError(c)),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -252,14 +339,11 @@ impl<'d> EspA7682EModem<'d> {
         }
     }
 
-    /// Query a `+C(E)REG` registration command and parse the `<stat>` field.
-    /// `prefix` is the expected response prefix, e.g. `"+CREG:"` or `"+CEREG:"`.
     fn query_reg_command(&mut self, cmd: &str, prefix: &str) -> RegistrationStatus {
         match self.send_raw(cmd) {
             Ok(lines) => {
                 for line in &lines {
                     if let Some(rest) = line.trim().strip_prefix(prefix) {
-                        // Format: <n>,<stat>[,<lac>,<ci>[,<AcT>]]
                         let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
                         if parts.len() >= 2 {
                             if let Ok(stat) = parts[1].parse::<i32>() {
@@ -274,11 +358,6 @@ impl<'d> EspA7682EModem<'d> {
         }
     }
 
-    /// Query both legacy (`AT+CREG?`) and EPS/LTE (`AT+CEREG?`) registration.
-    /// The A7682E is an LTE Cat-1 modem; on LTE-only carriers `CREG` will
-    /// always be unregistered, so `CEREG` is the source of truth. We query
-    /// both and return the more "registered" of the two so non-LTE carriers
-    /// still work.
     fn query_registration(&mut self) -> RegistrationStatus {
         let lte = self.query_reg_command("AT+CEREG?", "+CEREG:");
         let legacy = self.query_reg_command("AT+CREG?", "+CREG:");
@@ -303,6 +382,128 @@ impl<'d> EspA7682EModem<'d> {
             Err(_) => None,
         }
     }
+
+    /// Set up the PDP context for the given APN and dial into data mode.
+    /// Leaves the modem expecting PPP frames on the serial line.
+    fn dial_data(&mut self, apn: &str) -> Result<(), ModemError> {
+        // Verbose CME errors — turns "+CME ERROR: 11" into a real string
+        // in the logs, much easier to debug. Ignore failure, it's a
+        // nice-to-have.
+        let _ = self.send_raw("AT+CMEE=2");
+        // Explicit packet-domain attach. LTE modems usually auto-attach
+        // once registered, but forcing it is harmless and rules out one
+        // class of silent failure.
+        let _ = self.send_raw("AT+CGATT=1");
+        // Set the PDP context before dialing. EE's "everywhere" APN is
+        // the carrier-provided IPv4 context.
+        let cgdcont = format!("AT+CGDCONT=1,\"IP\",\"{}\"", apn);
+        self.send_raw(&cgdcont)?;
+        // Explicitly disable PAP/CHAP auth on context 1. Most A76xx
+        // firmware versions default to "no auth" but some require this
+        // to be set explicitly for PPP to succeed with a no-auth APN.
+        let _ = self.send_raw("AT+CGAUTH=1,0");
+
+        self.parser.reset();
+        self.drain_uart();
+        log::info!("modem: dialing ATD*99#");
+        self.write_command("ATD*99#")?;
+        self.wait_for_connect(Instant::now() + DIAL_TIMEOUT)
+    }
+
+    /// Create the PPP netif + driver and spawn the RX pump thread that
+    /// owns them. Blocks until the thread signals that PPP has an IP
+    /// address (via the `up_rx` channel) or the overall timeout fires.
+    fn start_ppp_session(&mut self) -> Result<(), ModemError> {
+        let netif = EspNetif::new(NetifStack::Ppp)
+            .map_err(|e| ModemError::Io(format!("ppp netif new: {:?}", e)))?;
+
+        // SAFETY: upgrade the Arc<UartDriver<'d>> to Arc<UartDriver<'static>>
+        // so the tx closure and the rx pump thread can be 'static. The
+        // UartDriver is held by `self.uart` which lives in main()'s
+        // infinite event loop, and the thread is joined by
+        // `disable_data` before the data session can be dropped. See
+        // the module-level "Lifetime workaround" section.
+        let uart_tx_static: Arc<UartDriver<'static>> =
+            unsafe { std::mem::transmute(Arc::clone(&self.uart)) };
+        let uart_rx_static: Arc<UartDriver<'static>> =
+            unsafe { std::mem::transmute(Arc::clone(&self.uart)) };
+
+        let mut netif_driver = EspNetifDriver::new(
+            netif,
+            |netif| {
+                netif.set_ppp_conf(&PppConfiguration {
+                    phase_events_enabled: false,
+                    error_events_enabled: false,
+                    ..Default::default()
+                })
+            },
+            move |data| {
+                uart_tx_static.write(data)?;
+                Ok(())
+            },
+        )
+        .map_err(|e| ModemError::Io(format!("ppp driver new: {:?}", e)))?;
+        // Crucial: `EspNetifDriver::new` leaves the driver in `started:
+        // false`. We have to call `start()` explicitly — under the hood
+        // that calls `esp_netif_action_start`, which is what triggers
+        // lwIP's PPP state machine to begin sending LCP configure
+        // requests. Without this the driver sits there silently and
+        // negotiation never starts, which was our 30-second "0 bytes"
+        // timeout symptom.
+        netif_driver
+            .start()
+            .map_err(|e| ModemError::Io(format!("ppp driver start: {:?}", e)))?;
+        let send_driver = SendNetifDriver(netif_driver);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let (up_tx, up_rx) = mpsc::channel::<()>();
+
+        let thread = thread::Builder::new()
+            .name("ppp-rx-pump".into())
+            .stack_size(4096)
+            .spawn(move || ppp_rx_pump(send_driver, uart_rx_static, stop_for_thread, up_tx))
+            .map_err(|e| ModemError::Io(format!("spawn ppp rx thread: {:?}", e)))?;
+
+        // Wait for the thread to report PPP up. If it times out or the
+        // channel closes (thread exited early), stop and join the thread
+        // so we don't leak it, and surface the failure.
+        let up_result = up_rx.recv_timeout(PPP_UP_TIMEOUT);
+
+        let session = DataSession {
+            stop,
+            thread: Some(thread),
+        };
+
+        match up_result {
+            Ok(()) => {
+                log::info!("ppp up");
+                self.data_session = Some(session);
+                Ok(())
+            }
+            Err(e) => {
+                let mut session = session;
+                session.stop_and_join();
+                Err(ModemError::Io(format!("ppp up timeout: {:?}", e)))
+            }
+        }
+    }
+
+    /// Send the `+++` escape sequence to return the modem from data mode
+    /// to command mode. Per the A76xx datasheet the modem requires:
+    ///   - at least 1 s of UART silence before the `+++`
+    ///   - the three `+` characters with no other bytes interspersed
+    ///   - at least 1 s of silence after, before it replies with `OK`
+    /// We honour both guard times.
+    fn escape_to_command_mode(&mut self) -> Result<(), ModemError> {
+        let _ = self.uart.wait_tx_done(100);
+        sleep(Duration::from_secs(1));
+        self.uart
+            .write(b"+++")
+            .map_err(|e| ModemError::Io(format!("+++: {:?}", e)))?;
+        sleep(Duration::from_secs(1));
+        Ok(())
+    }
 }
 
 impl Modem for EspA7682EModem<'_> {
@@ -311,13 +512,8 @@ impl Modem for EspA7682EModem<'_> {
             return Ok(());
         }
         log::info!("A7682E power-on pulse");
-        // 1000 ms press matches the T-Deck-Pro factory.ino retry timing
-        // and is comfortably above the A76xx datasheet minimum (~100 ms).
         self.pulse_pwrkey(Duration::from_millis(1000))?;
 
-        // The modem boot takes a few seconds. Poll AT until it responds.
-        // `powered` is set tentatively so the inner send_raw_with_timeout
-        // is allowed to run; it is cleared again on final timeout.
         let deadline = Instant::now() + POWER_ON_TIMEOUT;
         self.powered = true;
         loop {
@@ -328,9 +524,6 @@ impl Modem for EspA7682EModem<'_> {
             match self.send_raw_with_timeout("AT", Duration::from_millis(500)) {
                 Ok(_) => {
                     log::info!("A7682E responsive");
-                    // Disable command echo. Parser tolerates echo, but
-                    // turning it off keeps responses cleaner. Errors are
-                    // non-fatal — some firmware rev doesn't echo anyway.
                     let _ = self.send_raw("ATE0");
                     return Ok(());
                 }
@@ -349,9 +542,12 @@ impl Modem for EspA7682EModem<'_> {
         if !self.powered {
             return Ok(());
         }
+        // Tear down any active data session first so we don't leave PPP
+        // dangling against a modem that's about to lose power.
+        if self.data_session.is_some() {
+            let _ = self.disable_data();
+        }
         log::info!("A7682E power-off pulse");
-        // >= 2.5 s press required per A76xx datasheet; 3 s matches the
-        // T-Deck-Pro example.
         self.pulse_pwrkey(Duration::from_millis(3000))?;
         self.powered = false;
         self.parser.reset();
@@ -365,6 +561,9 @@ impl Modem for EspA7682EModem<'_> {
     fn status(&mut self) -> Result<ModemStatus, ModemError> {
         if !self.powered {
             return Err(ModemError::NotPowered);
+        }
+        if self.data_session.is_some() {
+            return Err(ModemError::DataActive);
         }
         let responsive = self.send_raw("AT").is_ok();
         let sim = self.query_sim();
@@ -386,17 +585,134 @@ impl Modem for EspA7682EModem<'_> {
         if !self.powered {
             return Err(ModemError::NotPowered);
         }
+        if self.data_session.is_some() {
+            return Err(ModemError::DataActive);
+        }
         self.parser.reset();
         self.drain_uart();
         self.write_command(cmd)?;
-        // Wait for the modem's `> ` request to send the body.
         self.read_until_prompt(Instant::now() + PROMPT_TIMEOUT)?;
-        // Write the body verbatim — caller supplies any terminator
-        // (Ctrl-Z for SMS).
         self.uart
             .write(body)
             .map_err(|e| ModemError::Io(format!("{:?}", e)))?;
-        // Wait for the final result code (e.g. `+CMGS: <ref>` then `OK`).
         self.read_until_final(Instant::now() + SEND_BODY_TIMEOUT)
     }
+
+    fn enable_data(&mut self, apn: &str) -> Result<(), ModemError> {
+        if !self.powered {
+            return Err(ModemError::NotPowered);
+        }
+        if self.data_session.is_some() {
+            return Ok(());
+        }
+        log::info!("enabling cellular data (APN={})", apn);
+
+        // 1) PDP context + dial-up into data mode. After this the modem
+        //    is expecting PPP frames on the UART, not AT commands.
+        self.dial_data(apn)?;
+
+        // 2) Create the PPP netif + driver, spawn the RX pump thread
+        //    that owns them, and wait for PPP negotiation.
+        self.start_ppp_session()
+    }
+
+    fn disable_data(&mut self) -> Result<(), ModemError> {
+        let Some(mut session) = self.data_session.take() else {
+            return Ok(());
+        };
+        log::info!("disabling cellular data");
+
+        // Stop the RX pump thread. When it exits, its destructor drops
+        // the EspNetifDriver it owns, which tears down the PPP stack and
+        // closes the netif.
+        session.stop_and_join();
+
+        // The modem is still in data mode from its own perspective
+        // (we haven't sent the escape sequence yet). Get it back to
+        // command mode via `+++` with the A76xx datasheet guard times,
+        // then `ATH` to hang up the data call.
+        if let Err(e) = self.escape_to_command_mode() {
+            log::warn!("escape to command mode failed: {:?}", e);
+        }
+        self.parser.reset();
+        self.drain_uart();
+        let _ = self.send_raw("ATH");
+        Ok(())
+    }
+
+    fn is_data_active(&self) -> bool {
+        self.data_session.is_some()
+    }
+}
+
+/// Body of the RX pump thread spawned by `start_ppp_session`. Reads
+/// UART bytes in a loop and feeds them into the PPP netif, exiting
+/// when `stop` is set. Signals `up_tx` once — the first time the netif
+/// reports `is_up() == true` — so `enable_data` can unblock.
+///
+/// The thread owns the `netif_driver` outright so we don't have to
+/// share it with the main thread (which would require Sync that we
+/// haven't proven). When the thread returns, the driver is dropped
+/// here, which tears down PPP and closes the netif.
+fn ppp_rx_pump(
+    send_driver: SendNetifDriver,
+    uart: Arc<UartDriver<'static>>,
+    stop: Arc<AtomicBool>,
+    up_tx: mpsc::Sender<()>,
+) {
+    let netif_driver = send_driver.0;
+    let mut buf = [0u8; 512];
+    let mut signalled_up = false;
+    // Block up to ~50 ms per read so the stop flag is checked at least
+    // that often even when the line is completely silent.
+    const READ_TICKS_PUMP: u32 = 5;
+
+    // Running totals for a one-line summary at shutdown. Intermediate
+    // per-second log lines only fire when there's actual activity, to
+    // keep the console quiet during idle cellular sessions.
+    let mut total_bytes: u64 = 0;
+    let mut bytes_this_sec: usize = 0;
+    let mut last_tick = Instant::now();
+
+    log::info!("ppp rx pump started");
+
+    while !stop.load(Ordering::Relaxed) {
+        match uart.read(&mut buf, READ_TICKS_PUMP) {
+            Ok(n) if n > 0 => {
+                bytes_this_sec += n;
+                total_bytes += n as u64;
+                if let Err(e) = netif_driver.rx(&buf[..n]) {
+                    log::warn!("ppp rx ingest failed: {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.code() == ESP_ERR_TIMEOUT => {}
+            Err(e) => {
+                log::warn!("ppp rx uart read error: {:?}", e);
+                // Don't exit on a transient error — the modem will
+                // recover once more bytes arrive.
+            }
+        }
+
+        if last_tick.elapsed() >= Duration::from_secs(1) {
+            if bytes_this_sec > 0 {
+                log::info!("ppp rx: {} B/s", bytes_this_sec);
+            }
+            bytes_this_sec = 0;
+            last_tick = Instant::now();
+        }
+
+        if !signalled_up {
+            match netif_driver.netif().is_up() {
+                Ok(true) => {
+                    let _ = up_tx.send(());
+                    signalled_up = true;
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("ppp is_up check failed: {:?}", e),
+            }
+        }
+    }
+    log::info!("ppp rx pump stopped ({} bytes total)", total_bytes);
+    // Dropping `netif_driver` here tears down PPP.
 }

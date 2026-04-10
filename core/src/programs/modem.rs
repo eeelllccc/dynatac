@@ -1,16 +1,25 @@
-//! `modem` — control the 4G LTE modem (power, status, raw AT).
+//! `modem` — control the 4G LTE modem (power, status, raw AT, data).
 //!
 //! Subcommands:
-//!   - `modem status`    — show powered/SIM/registration/signal
-//!   - `modem on`        — power on and wait until responsive
-//!   - `modem off`       — power off
-//!   - `modem at <cmd>`  — send a raw AT command and print the info lines
+//!   - `modem status`     — show powered/SIM/registration/signal
+//!   - `modem on`         — power on and wait until responsive
+//!   - `modem off`        — power off
+//!   - `modem at <cmd>`   — send a raw AT command and print the info lines
+//!   - `modem data on`    — bring up a PPP cellular data session (uses the
+//!                          hardcoded APN from `crate::network::APN`)
+//!   - `modem data off`   — tear down the data session
+//!   - `modem data status` — show whether data is currently active
 //!
 //! The modem is lazy: it does not turn on at boot (the cellular radio is
 //! the most power-hungry thing on the device). A user must explicitly
 //! `modem on` before any data- or SMS-dependent command can use it.
+//!
+//! `modem data on` is the manual equivalent of what `ensure_connectivity`
+//! does automatically when WiFi is disconnected and a program (curl,
+//! email) needs network access. Useful for testing PPP in isolation.
 
 use crate::modem::{ModemStatus, RegistrationStatus, SimStatus};
+use crate::network::APN;
 
 use super::{ExecContext, ProgramResult};
 
@@ -20,8 +29,11 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
         Some("on") => power_on(ctx),
         Some("off") => power_off(ctx),
         Some("at") => raw(&args[1..], ctx),
+        Some("data") => data(&args[1..], ctx),
         Some(other) => ProgramResult::err(format!("unknown subcommand: {}", other)),
-        None => ProgramResult::ok("usage: modem [status|on|off|at <cmd>]".to_string()),
+        None => ProgramResult::ok(
+            "usage: modem [status|on|off|at <cmd>|data on|data off|data status]".to_string(),
+        ),
     }
 }
 
@@ -46,6 +58,46 @@ fn power_off(ctx: &mut ExecContext) -> ProgramResult {
     match ctx.modem.power_off() {
         Ok(()) => ProgramResult::ok("modem off".to_string()),
         Err(e) => ProgramResult::err(format!("power off failed: {}", e.display())),
+    }
+}
+
+fn data(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
+    match args.first().copied() {
+        Some("on") => data_on(ctx),
+        Some("off") => data_off(ctx),
+        Some("status") | None => data_status(ctx),
+        Some(other) => ProgramResult::err(format!("unknown data subcommand: {}", other)),
+    }
+}
+
+fn data_on(ctx: &mut ExecContext) -> ProgramResult {
+    if !ctx.modem.is_powered() {
+        return ProgramResult::err("modem is off — run `modem on` first".to_string());
+    }
+    if ctx.modem.is_data_active() {
+        return ProgramResult::ok("data already up".to_string());
+    }
+    match ctx.modem.enable_data(APN) {
+        Ok(()) => ProgramResult::ok(format!("data up (APN={})", APN)),
+        Err(e) => ProgramResult::err(format!("data up failed: {}", e.display())),
+    }
+}
+
+fn data_off(ctx: &mut ExecContext) -> ProgramResult {
+    if !ctx.modem.is_data_active() {
+        return ProgramResult::ok("data already down".to_string());
+    }
+    match ctx.modem.disable_data() {
+        Ok(()) => ProgramResult::ok("data down".to_string()),
+        Err(e) => ProgramResult::err(format!("data down failed: {}", e.display())),
+    }
+}
+
+fn data_status(ctx: &mut ExecContext) -> ProgramResult {
+    if ctx.modem.is_data_active() {
+        ProgramResult::ok("data: up".to_string())
+    } else {
+        ProgramResult::ok("data: down".to_string())
     }
 }
 
@@ -250,6 +302,83 @@ mod tests {
         let r = run(&["at", "AT+CMGF=1"], &mut env.ctx());
         assert_eq!(r.exit_code, 0);
         assert_eq!(r.output, "OK");
+    }
+
+    // --- data subcommand ----------------------------------------------------
+
+    #[test]
+    fn data_status_when_down() {
+        let mut env = Env::new();
+        let r = run(&["data", "status"], &mut env.ctx());
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.output, "data: down");
+    }
+
+    #[test]
+    fn data_on_when_modem_off_errors() {
+        let mut env = Env::new();
+        let r = run(&["data", "on"], &mut env.ctx());
+        assert_eq!(r.exit_code, 1);
+        assert!(r.output.contains("modem is off"));
+    }
+
+    #[test]
+    fn data_on_happy_path() {
+        let mut env = Env::new();
+        env.modem.power_on().unwrap();
+        let r = run(&["data", "on"], &mut env.ctx());
+        assert_eq!(r.exit_code, 0);
+        assert!(r.output.contains("data up"));
+        assert!(env.modem.is_data_active());
+        assert_eq!(env.modem.last_apn.as_deref(), Some(crate::network::APN));
+    }
+
+    #[test]
+    fn data_on_when_already_active_is_noop() {
+        let mut env = Env::new();
+        env.modem.power_on().unwrap();
+        env.modem.enable_data(crate::network::APN).unwrap();
+        let r = run(&["data", "on"], &mut env.ctx());
+        assert_eq!(r.exit_code, 0);
+        assert!(r.output.contains("already up"));
+    }
+
+    #[test]
+    fn data_off_happy_path() {
+        let mut env = Env::new();
+        env.modem.power_on().unwrap();
+        env.modem.enable_data(crate::network::APN).unwrap();
+        let r = run(&["data", "off"], &mut env.ctx());
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.output, "data down");
+        assert!(!env.modem.is_data_active());
+    }
+
+    #[test]
+    fn data_off_when_already_down_is_noop() {
+        let mut env = Env::new();
+        let r = run(&["data", "off"], &mut env.ctx());
+        assert_eq!(r.exit_code, 0);
+        assert!(r.output.contains("already down"));
+    }
+
+    #[test]
+    fn data_on_propagates_modem_error() {
+        let mut env = Env::new();
+        env.modem.power_on().unwrap();
+        env.modem.enable_data_error = Some(crate::modem::ModemError::Timeout);
+        let r = run(&["data", "on"], &mut env.ctx());
+        assert_eq!(r.exit_code, 1);
+        assert!(r.output.contains("data up failed"));
+        assert!(r.output.contains("timeout"));
+    }
+
+    #[test]
+    fn data_unknown_subcommand_errors() {
+        let mut env = Env::new();
+        let r = run(&["data", "nope"], &mut env.ctx());
+        assert_eq!(r.exit_code, 1);
+        assert!(r.output.contains("unknown data subcommand"));
     }
 
     #[test]

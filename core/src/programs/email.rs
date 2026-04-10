@@ -32,6 +32,7 @@
 
 use super::{ExecContext, ProgramResult};
 use crate::email::{Email, SmtpSession};
+use crate::network::{ensure_connectivity, ActiveTransport, APN};
 
 const GMAIL_HOST: &str = "smtp.gmail.com";
 const GMAIL_PORT: u16 = 465;
@@ -65,6 +66,13 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
             );
         }
     };
+    // Make sure *some* IP transport is live (WiFi, or cellular as a
+    // fallback). On a cellular fallback this can take 10–20 s the first
+    // time while the modem dials in.
+    let transport = match ensure_connectivity(ctx.wifi, ctx.modem, APN) {
+        Ok(t) => t,
+        Err(e) => return ProgramResult::err(format!("no connectivity: {}", e.display())),
+    };
     let email = Email {
         from: creds.address.clone(),
         to: to.to_string(),
@@ -76,6 +84,11 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
         Ok(s) => s,
         Err(e) => return ProgramResult::err(format!("connect: {}", e)),
     };
+    // Small visible marker so the user knows cellular fallback kicked in.
+    let transport_note = match transport {
+        ActiveTransport::Wifi => "",
+        ActiveTransport::Cellular => " (via cellular)",
+    };
     match SmtpSession::send(
         stream,
         EHLO_NAME,
@@ -83,7 +96,7 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
         &creds.app_password,
         &email,
     ) {
-        Ok(()) => ProgramResult::ok(format!("sent to {}", to)),
+        Ok(()) => ProgramResult::ok(format!("sent to {}{}", to, transport_note)),
         Err(e) => ProgramResult::err(format!("send failed: {}", e)),
     }
 }
@@ -157,8 +170,8 @@ mod tests {
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
     use crate::saved_networks::MockNetworkStore;
-    use crate::modem::MockModem;
-    use crate::wifi::MockWifiDriver;
+    use crate::modem::{MockModem, Modem};
+    use crate::wifi::{MockWifiDriver, WifiDriver};
 
     struct Env {
         wifi: MockWifiDriver,
@@ -170,15 +183,20 @@ mod tests {
     }
 
     impl Env {
+        /// Builds an Env with WiFi connected by default — the normal
+        /// operating state we expect for most tests. Tests that want to
+        /// exercise the cellular fallback call `wifi.disconnect()`.
         fn new() -> Self {
-            Self {
+            let mut env = Self {
                 wifi: MockWifiDriver::new(),
                 http: MockHttpClient::new(),
                 saved: MockNetworkStore::new(),
                 smtp: MockSmtpStreamFactory::new(),
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
-            }
+            };
+            env.wifi.connect("home_wifi", "").unwrap();
+            env
         }
         fn ctx(&mut self) -> ExecContext<'_> {
             ExecContext {
@@ -260,6 +278,8 @@ mod tests {
         );
         assert_eq!(r.exit_code, 0, "output was: {}", r.output);
         assert!(r.output.contains("sent to you@example.com"));
+        // WiFi was connected from the start; the modem was never touched.
+        assert!(!env.modem.is_powered());
 
         assert_eq!(env.smtp.open_count, 1);
         let written = env.smtp.stream.written_str();
@@ -281,6 +301,30 @@ mod tests {
 
         let written = env.smtp.stream.written_str();
         assert!(written.contains("first line\r\nsecond line\r\n\r\nfourth\r\n.\r\n"));
+    }
+
+    #[test]
+    fn falls_back_to_cellular_when_wifi_down() {
+        let mut env = Env::new();
+        env.wifi.disconnect().unwrap();
+        env.creds.set_gmail("me@gmail.com", "pw").unwrap();
+        install_happy_server(&mut env);
+
+        let r = run(
+            &["you@example.com", "hi", "hello there"],
+            &mut env.ctx(),
+        );
+        assert_eq!(r.exit_code, 0, "output was: {}", r.output);
+        // Success message notes the cellular path.
+        assert!(r.output.contains("sent to you@example.com"));
+        assert!(
+            r.output.contains("(via cellular)"),
+            "expected cellular marker in: {}",
+            r.output
+        );
+        // Modem was brought up as part of the fallback.
+        assert!(env.modem.is_powered());
+        assert!(env.modem.is_data_active());
     }
 
     // --- Send: failure paths -------------------------------------------------
