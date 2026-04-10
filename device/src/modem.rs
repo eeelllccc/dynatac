@@ -42,6 +42,14 @@ use esp_idf_svc::sys::ESP_ERR_TIMEOUT;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time to wait for the modem to become responsive after power-on.
 const POWER_ON_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum time to wait for the `> ` prompt after issuing a body-soliciting
+/// command (e.g. `AT+CMGS`). Modems usually respond within 1–2 s but can
+/// be slower if the SMS subsystem is busy.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time to wait for the final result code after writing a body.
+/// SMS over-the-air delivery on a weak signal can take 30+ s, so we
+/// allow a generous budget here.
+const SEND_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Per-read blocking tick budget. Small so the outer deadline drives
 /// cancellation; the exact value depends on CONFIG_FREERTOS_HZ but is
 /// only a polling granularity.
@@ -186,6 +194,42 @@ impl<'d> EspA7682EModem<'d> {
         self.drain_uart();
         self.write_command(cmd)?;
         self.read_until_final(Instant::now() + timeout)
+    }
+
+    /// Read bytes and feed the parser until we observe an `AtEvent::Prompt`
+    /// (the modem's `"> "` request for a body) or the deadline passes.
+    /// Final result codes encountered before the prompt are surfaced as
+    /// errors — they mean the modem rejected the command outright.
+    fn read_until_prompt(&mut self, deadline: Instant) -> Result<(), ModemError> {
+        let mut buf = [0u8; 256];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ModemError::Timeout);
+            }
+            let n = match self.uart.read(&mut buf, READ_TICKS) {
+                Ok(n) => n,
+                Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
+                Err(e) => return Err(ModemError::Io(format!("{:?}", e))),
+            };
+            if n == 0 {
+                continue;
+            }
+            for event in self.parser.feed(&buf[..n]) {
+                match event {
+                    AtEvent::Prompt => return Ok(()),
+                    AtEvent::Line(line) => match classify(&line) {
+                        LineClass::Error => return Err(ModemError::Error),
+                        LineClass::CmeError(c) => return Err(ModemError::CmeError(c)),
+                        LineClass::CmsError(c) => return Err(ModemError::CmsError(c)),
+                        LineClass::NoCarrier => return Err(ModemError::Error),
+                        LineClass::Urc(urc) => log::info!("modem URC: {:?}", urc),
+                        // Echo, info, ok before prompt: discard, the
+                        // prompt should arrive next.
+                        _ => {}
+                    },
+                }
+            }
+        }
     }
 
     fn query_sim(&mut self) -> SimStatus {
@@ -336,5 +380,23 @@ impl Modem for EspA7682EModem<'_> {
 
     fn send_raw(&mut self, cmd: &str) -> Result<Vec<String>, ModemError> {
         self.send_raw_with_timeout(cmd, COMMAND_TIMEOUT)
+    }
+
+    fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError> {
+        if !self.powered {
+            return Err(ModemError::NotPowered);
+        }
+        self.parser.reset();
+        self.drain_uart();
+        self.write_command(cmd)?;
+        // Wait for the modem's `> ` request to send the body.
+        self.read_until_prompt(Instant::now() + PROMPT_TIMEOUT)?;
+        // Write the body verbatim — caller supplies any terminator
+        // (Ctrl-Z for SMS).
+        self.uart
+            .write(body)
+            .map_err(|e| ModemError::Io(format!("{:?}", e)))?;
+        // Wait for the final result code (e.g. `+CMGS: <ref>` then `OK`).
+        self.read_until_final(Instant::now() + SEND_BODY_TIMEOUT)
     }
 }

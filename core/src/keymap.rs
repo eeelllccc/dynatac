@@ -21,7 +21,9 @@ pub const COLS: u8 = 10;
 //   '\n'    → Enter
 //   '\x01'  → Shift modifier (toggle)
 //   '\x02'  → Sym modifier (toggle)
-//   '\x03'  → Mic (no-op for now)
+//   '\x03'  → Mic key. Bare press is a no-op; Sym+Mic produces '0'
+//             (the digit isn't reachable on the letter rows, where Sym
+//             covers 1–9 only).
 //   '\0'    → unmapped / no key
 
 #[rustfmt::skip]
@@ -38,7 +40,7 @@ const SYM_MAP: [[char; COLS as usize]; ROWS as usize] = [
     ['#', '1', '2', '3', '(', ')', '_', '-',  '+',    '@'   ],  // row 0
     ['*', '4', '5', '6', '/', ':', ';', '\'', '"',    '\x08'],  // row 1
     ['\x04','7', '8', '9', '?', '!', '`', '.',  '$',    '\n'  ],  // row 2
-    ['\0','\0','\0','\0','\0', '\x01','\x03',' ',  '\x02','\x01'], // row 3
+    ['\0','\0','\0','\0','\0', '\x01','0',' ',  '\x02','\x01'], // row 3  (col6=sym+mic → '0')
 ];
 
 /// A decoded key press.
@@ -124,7 +126,21 @@ impl KeyMapper {
                 self.sym_on = !self.sym_on;
                 None
             }
-            '\x03' | '\0' => None,
+            '\x03' => {
+                // Mic key: bare press is a no-op; Sym+Mic is the only way
+                // to type '0' on this keyboard (Sym mode covers 1–9 on
+                // the letter rows but leaves 0 without a home). The `c =>`
+                // arm below does the normal Sym lookup for letter keys,
+                // but this key has no base character so we have to handle
+                // the Sym branch here explicitly — driven by SYM_MAP so
+                // the sym table remains the single source of truth.
+                if self.sym_on {
+                    Some(KeyEvent::Char(SYM_MAP[row as usize][col as usize]))
+                } else {
+                    None
+                }
+            }
+            '\0' => None,
             '\x04' => {
                 self.alt_on = !self.alt_on;
                 None
@@ -320,6 +336,37 @@ mod tests {
     fn mic_returns_none() {
         let mut km = KeyMapper::new();
         // row=3, col=6 = '\x03' (Mic)
+        assert_eq!(km.process(3, 6, true), None);
+    }
+
+    #[test]
+    fn sym_mic_produces_zero() {
+        let mut km = KeyMapper::new();
+        km.process(3, 8, true); // Sym on
+        // row=3, col=6 = Mic
+        assert_eq!(km.process(3, 6, true), Some(KeyEvent::Char('0')));
+        // Sym stays on, consistent with all other sym keys — so the user
+        // can type "000" (or "100", "0800…") without re-toggling Sym.
+        assert!(km.sym_on());
+        assert_eq!(km.process(3, 6, true), Some(KeyEvent::Char('0')));
+        assert_eq!(km.process(3, 6, true), Some(KeyEvent::Char('0')));
+    }
+
+    #[test]
+    fn alt_mic_does_nothing() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // Mic with only Alt (no Sym) is a no-op.
+        assert_eq!(km.process(3, 6, true), None);
+    }
+
+    #[test]
+    fn mic_without_sym_is_no_op_after_sym_mic() {
+        let mut km = KeyMapper::new();
+        km.process(3, 8, true); // Sym on
+        km.process(3, 6, true); // Sym+Mic → '0'
+        km.process(3, 8, true); // Sym off
+        // Bare Mic is a no-op again.
         assert_eq!(km.process(3, 6, true), None);
     }
 

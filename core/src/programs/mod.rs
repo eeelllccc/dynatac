@@ -14,6 +14,7 @@ pub mod curl;
 pub mod echo;
 pub mod email;
 pub mod modem;
+pub mod sms;
 pub mod wifi;
 
 /// Ambient state available to every program (clock, drivers, etc.).
@@ -92,6 +93,13 @@ pub static PROGRAMS: &[Program] = &[
         name: "modem",
         usage: "modem [status|on|off|at <cmd>]",
         run: modem::run,
+        on_list_select: None,
+        on_text_submit: None,
+    },
+    Program {
+        name: "sms",
+        usage: "sms [send <number> <body>|inbox|read <idx>|delete <idx>]",
+        run: sms::run,
         on_list_select: None,
         on_text_submit: None,
     },

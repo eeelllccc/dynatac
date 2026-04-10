@@ -178,17 +178,37 @@ pub trait Modem {
     /// information lines that preceded the final result code, or a
     /// classified error. Command echo is stripped automatically.
     fn send_raw(&mut self, cmd: &str) -> Result<Vec<String>, ModemError>;
+    /// Send a command that solicits a `> ` prompt, then write `body`,
+    /// then wait for a final result code. Used for `AT+CMGS` and
+    /// similar prompt-based protocols.
+    ///
+    /// The caller is responsible for any command-specific terminator at
+    /// the end of `body` (e.g. Ctrl-Z (`0x1A`) for SMS). The body is
+    /// written to the modem verbatim — no escaping or transformation.
+    ///
+    /// Implementations should use a longer overall timeout than
+    /// `send_raw` (e.g. 60 s) since over-the-air SMS delivery can be
+    /// slow on weak signal.
+    fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError>;
 }
 
 /// In-memory test double for [`Modem`].
 ///
-/// Tracks power state and returns scripted responses for `send_raw`.
+/// Tracks power state and returns scripted responses for `send_raw` and
+/// `send_with_body`. Also records the bodies passed to `send_with_body`
+/// so tests can assert they were encoded correctly.
+///
 /// The default status is "registered, SIM ready, strong signal" so
 /// programs that only inspect `status()` work without setup.
 pub struct MockModem {
     powered: bool,
     status: ModemStatus,
     raw_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
+    body_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
+    /// All commands sent via `send_raw`, in order.
+    pub raw_log: Vec<String>,
+    /// All `(cmd, body)` pairs sent via `send_with_body`, in order.
+    pub body_log: Vec<(String, Vec<u8>)>,
 }
 
 impl MockModem {
@@ -202,6 +222,9 @@ impl MockModem {
                 signal_dbm: Some(-71),
             },
             raw_responses: std::collections::HashMap::new(),
+            body_responses: std::collections::HashMap::new(),
+            raw_log: Vec::new(),
+            body_log: Vec::new(),
         }
     }
 
@@ -213,6 +236,14 @@ impl MockModem {
     /// Register a canned response for a raw command.
     pub fn on_raw(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
         self.raw_responses.insert(cmd.to_string(), response);
+    }
+
+    /// Register a canned response for a `send_with_body` command. The body
+    /// is not part of the key — the script reacts based on the command
+    /// alone, mirroring how the real modem responds the same way regardless
+    /// of body content for valid commands.
+    pub fn on_with_body(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
+        self.body_responses.insert(cmd.to_string(), response);
     }
 }
 
@@ -250,7 +281,19 @@ impl Modem for MockModem {
         if !self.powered {
             return Err(ModemError::NotPowered);
         }
+        self.raw_log.push(cmd.to_string());
         match self.raw_responses.get(cmd) {
+            Some(r) => r.clone(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError> {
+        if !self.powered {
+            return Err(ModemError::NotPowered);
+        }
+        self.body_log.push((cmd.to_string(), body.to_vec()));
+        match self.body_responses.get(cmd) {
             Some(r) => r.clone(),
             None => Ok(Vec::new()),
         }
@@ -419,6 +462,38 @@ mod tests {
         let mut m = MockModem::new();
         m.power_on().unwrap();
         assert_eq!(m.send_raw("AT").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mock_send_with_body_records_command_and_body() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.on_with_body("AT+CMGS=\"+447\"", Ok(vec!["+CMGS: 42".into()]));
+        let result = m.send_with_body("AT+CMGS=\"+447\"", b"hello\x1a").unwrap();
+        assert_eq!(result, vec!["+CMGS: 42"]);
+        assert_eq!(m.body_log.len(), 1);
+        assert_eq!(m.body_log[0].0, "AT+CMGS=\"+447\"");
+        assert_eq!(m.body_log[0].1, b"hello\x1a");
+    }
+
+    #[test]
+    fn mock_send_with_body_requires_power() {
+        let mut m = MockModem::new();
+        assert_eq!(
+            m.send_with_body("AT+CMGS=\"+1\"", b"x").unwrap_err(),
+            ModemError::NotPowered
+        );
+    }
+
+    #[test]
+    fn mock_raw_log_records_commands_in_order() {
+        let mut m = MockModem::new();
+        m.power_on().unwrap();
+        m.send_raw("AT").ok();
+        m.send_raw("AT+CMGF=1").ok();
+        // power_on doesn't go through send_raw on the mock, so the log
+        // contains only what we explicitly sent.
+        assert_eq!(m.raw_log, vec!["AT", "AT+CMGF=1"]);
     }
 
     #[test]

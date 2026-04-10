@@ -6,6 +6,7 @@ pub mod keymap;
 pub mod list_selector;
 pub mod modem;
 pub mod programs;
+pub mod sms;
 pub mod saved_networks;
 pub mod shell;
 pub mod startup;
