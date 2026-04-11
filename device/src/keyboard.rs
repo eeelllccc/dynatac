@@ -11,21 +11,20 @@
 // key code (1-based: code = row * COLS + col + 1).
 //
 // Caller invariants:
-//   - An I2C master for GPIO13/GPIO14 must be initialised before
-//     constructing `Keyboard`.
+//   - An `I2cDevice` bound to the TCA8418 (addr 0x34) on the shared
+//     GPIO13/14 bus must be provided.
 //
 // Callee invariants:
 //   - The FIFO is flushed during `new()`.
 //   - Only key-press events are surfaced; releases are silently consumed.
 
-use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::hal::sys::EspError;
 
 use dynatac_core::keymap::{KeyEvent, KeyMapper, COLS, ROWS};
 
-// --- TCA8418 I2C address and registers ----------------------------------------
+use crate::i2c_bus::I2cDevice;
 
-const ADDR: u8 = 0x34;
+// --- TCA8418 registers --------------------------------------------------------
 
 const REG_CFG: u8 = 0x01;
 const REG_INT_STAT: u8 = 0x02;
@@ -37,17 +36,17 @@ const REG_KP_GPIO_2: u8 = 0x1E;
 /// Driver for the TCA8418 keyboard on the T-Deck-Pro.
 ///
 /// Wraps a `KeyMapper` for key-to-event translation and manages I2C
-/// communication with the TCA8418 hardware.
-pub struct Keyboard<'d> {
-    i2c: I2cDriver<'d>,
+/// communication with the TCA8418 hardware via a shared-bus handle.
+pub struct Keyboard<'a, 'd> {
+    dev: I2cDevice<'a, 'd>,
     mapper: KeyMapper,
 }
 
-impl<'d> Keyboard<'d> {
+impl<'a, 'd> Keyboard<'a, 'd> {
     /// Initialise the TCA8418 as a 4×10 key matrix and flush the FIFO.
-    pub fn new(i2c: I2cDriver<'d>) -> Result<Self, EspError> {
+    pub fn new(dev: I2cDevice<'a, 'd>) -> Result<Self, EspError> {
         let mut kb = Keyboard {
-            i2c,
+            dev,
             mapper: KeyMapper::new(),
         };
         kb.configure_matrix()?;
@@ -102,12 +101,12 @@ impl<'d> Keyboard<'d> {
 
     fn read_reg(&mut self, reg: u8) -> Result<u8, EspError> {
         let mut buf = [0u8; 1];
-        self.i2c.write_read(ADDR, &[reg], &mut buf, 100)?;
+        self.dev.write_read(&[reg], &mut buf)?;
         Ok(buf[0])
     }
 
     fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), EspError> {
-        self.i2c.write(ADDR, &[reg, val], 100)?;
+        self.dev.write(&[reg, val])?;
         Ok(())
     }
 

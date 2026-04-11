@@ -1,3 +1,4 @@
+pub mod battery;
 pub mod credentials;
 pub mod email;
 pub mod framebuffer;

@@ -3,6 +3,7 @@
 //! Each program is a function `fn(&[&str], &mut ExecContext) -> ProgramResult`.
 //! Programs live in their own submodules and are registered in [`PROGRAMS`].
 
+use crate::battery::BatteryDriver;
 use crate::credentials::CredentialStore;
 use crate::email::SmtpStreamFactory;
 use crate::http::HttpClient;
@@ -10,6 +11,7 @@ use crate::modem::Modem;
 use crate::saved_networks::NetworkStore;
 use crate::wifi::WifiDriver;
 
+pub mod battery;
 pub mod curl;
 pub mod echo;
 pub mod email;
@@ -27,6 +29,7 @@ pub struct ExecContext<'a> {
     pub smtp: &'a mut dyn SmtpStreamFactory,
     pub credentials: &'a mut dyn CredentialStore,
     pub modem: &'a mut dyn Modem,
+    pub battery: &'a mut dyn BatteryDriver,
 }
 
 /// The result of running a program.
@@ -69,6 +72,13 @@ pub struct Program {
 
 /// All available programs. The shell searches this list by name.
 pub static PROGRAMS: &[Program] = &[
+    Program {
+        name: "battery",
+        usage: "battery [level|charging]",
+        run: battery::run,
+        on_list_select: None,
+        on_text_submit: None,
+    },
     Program {
         name: "curl",
         usage: "curl <url> — fetch a URL via HTTP GET",

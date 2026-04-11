@@ -160,6 +160,7 @@ fn cancel_or_empty_error(ctx: &mut ExecContext) -> ProgramResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::battery::MockBatteryDriver;
     use crate::credentials::{CredentialStore, MockCredentialStore};
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
@@ -174,6 +175,7 @@ mod tests {
         smtp: MockSmtpStreamFactory,
         creds: MockCredentialStore,
         modem: MockModem,
+        battery: MockBatteryDriver,
     }
 
     impl Env {
@@ -188,6 +190,7 @@ mod tests {
                 smtp: MockSmtpStreamFactory::new(),
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
+                battery: MockBatteryDriver::new(),
             };
             env.wifi.connect("home_wifi", "").unwrap();
             env
@@ -201,6 +204,7 @@ mod tests {
                 smtp: &mut self.smtp,
                 credentials: &mut self.creds,
                 modem: &mut self.modem,
+                battery: &mut self.battery,
             }
         }
     }

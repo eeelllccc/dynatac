@@ -1,5 +1,7 @@
+mod battery;
 mod display;
 mod http;
+mod i2c_bus;
 pub mod keyboard;
 mod modem;
 mod nvs_credential_store;
@@ -19,19 +21,25 @@ use esp_idf_svc::hal::{
     units::Hertz,
 };
 
+use battery::Battery;
 use display::Epd;
+use dynatac_core::battery::BQ27220_ADDR;
 use dynatac_core::programs::ExecContext;
 use dynatac_core::shell::{Shell, ShellAction};
 use dynatac_core::terminal::{Terminal, TerminalAction};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use http::EspHttpClient;
+use i2c_bus::I2cBus;
 use modem::EspA7682EModem;
 use nvs_credential_store::NvsCredentialStore;
 use nvs_network_store::NvsNetworkStore;
 use smtp::EspSmtpStreamFactory;
 use wifi::EspWifiDriver;
 use keyboard::Keyboard;
+
+/// TCA8418 keyboard I2C address.
+const KEYBOARD_ADDR: u8 = 0x34;
 
 /// Row height in pixels: 8px font + 2px gap.
 const ROW_HEIGHT: u16 = 10;
@@ -82,16 +90,18 @@ fn main() {
 
     let mut epd = Epd::new(spi_device, cs, dc, busy);
 
-    // --- I2C bus for keyboard ----------------------------------------------------
-    let i2c = I2cDriver::new(
+    // --- Shared I2C bus (keyboard, touch, gyro, fuel gauge, charger) ------------
+    let i2c_driver = I2cDriver::new(
         peripherals.i2c0,
         pins.gpio13,
         pins.gpio14,
         &I2cConfig::new().baudrate(Hertz(100_000)),
     )
     .unwrap();
+    let i2c_bus = I2cBus::new(i2c_driver);
 
-    let mut kb = Keyboard::new(i2c).unwrap();
+    let mut kb = Keyboard::new(i2c_bus.device(KEYBOARD_ADDR)).unwrap();
+    let mut battery = Battery::new(i2c_bus.device(BQ27220_ADDR));
 
     // --- Drivers -----------------------------------------------------------------
     let mut wifi = EspWifiDriver::new(peripherals.modem, sysloop, Some(nvs.clone()));
@@ -157,6 +167,7 @@ fn main() {
                             smtp: &mut smtp_factory,
                             credentials: &mut credentials,
                             modem: &mut modem_driver,
+                            battery: &mut battery,
                         };
                         let was_interactive = true;
                         match shell.handle_interactive_key(event, &mut ctx) {
@@ -190,6 +201,7 @@ fn main() {
                                     smtp: &mut smtp_factory,
                                     credentials: &mut credentials,
                                     modem: &mut modem_driver,
+                                    battery: &mut battery,
                                 };
                                 match shell.execute(&cmd, &mut ctx) {
                                     ShellAction::Output(output) => {
