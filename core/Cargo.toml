@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Facade only — no runtime cost when no logger is registered (as in
+# host tests). The device binary registers EspLogger at boot, at which
+# point log calls from core route to the esp-idf console.
+log = "0.4"

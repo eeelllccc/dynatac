@@ -14,6 +14,7 @@ pub mod curl;
 pub mod echo;
 pub mod email;
 pub mod modem;
+pub mod net;
 pub mod sms;
 pub mod wifi;
 
@@ -93,6 +94,13 @@ pub static PROGRAMS: &[Program] = &[
         name: "modem",
         usage: "modem [status|on|off|at <cmd>]",
         run: modem::run,
+        on_list_select: None,
+        on_text_submit: None,
+    },
+    Program {
+        name: "net",
+        usage: "net [status] — show active network transport",
+        run: net::run,
         on_list_select: None,
         on_text_submit: None,
     },

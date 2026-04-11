@@ -291,6 +291,10 @@ impl Modem for MockModem {
     }
 
     fn power_off(&mut self) -> Result<(), ModemError> {
+        // Mirror the real EspA7682EModem: tear down any active data
+        // session before powering off so tests reflect the invariant
+        // that a powered-off modem has no data session.
+        self.data_active = false;
         self.powered = false;
         self.status.responsive = false;
         Ok(())

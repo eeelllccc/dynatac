@@ -1,29 +1,26 @@
 //! `curl` — fetch a URL via HTTP GET and print the response body.
+//!
+//! Transport-agnostic: the program doesn't know or care whether it's
+//! running over wifi or cellular. `ensure_connectivity` decides, and
+//! its transition logs tell the user when fallback happens. Program
+//! output is the HTTP response body verbatim, regardless of transport.
 
 use super::{ExecContext, ProgramResult};
-use crate::network::{ensure_connectivity, ActiveTransport, APN};
+use crate::network::{ensure_connectivity, APN};
 
 pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
     let url = match args.first() {
         Some(u) => *u,
         None => return ProgramResult::err("usage: curl <url>".to_string()),
     };
-    // Make sure *some* IP transport is live (WiFi, or cellular as a
-    // fallback). The first cellular fallback can take 10–20 s while the
-    // modem dials in; subsequent calls within the same session are fast.
-    let transport = match ensure_connectivity(ctx.wifi, ctx.modem, APN) {
-        Ok(t) => t,
-        Err(e) => return ProgramResult::err(format!("no connectivity: {}", e.display())),
-    };
+    // Make sure *some* IP transport is live. The first cellular
+    // fallback can take 10–20 s while the modem dials in; subsequent
+    // calls within the same session are fast.
+    if let Err(e) = ensure_connectivity(ctx.wifi, ctx.modem, APN) {
+        return ProgramResult::err(format!("no connectivity: {}", e.display()));
+    }
     match ctx.http.get(url) {
-        Ok(body) => match transport {
-            ActiveTransport::Wifi => ProgramResult::ok(body),
-            ActiveTransport::Cellular => {
-                // Prepend a small marker so the user knows cellular
-                // fallback was used. One line, no extra formatting.
-                ProgramResult::ok(format!("(via cellular)\n{}", body))
-            }
-        },
+        Ok(body) => ProgramResult::ok(body),
         Err(e) => ProgramResult::err(format!("error: {}", e)),
     }
 }
@@ -104,10 +101,12 @@ mod tests {
         env.http
             .on_get("http://example.com", Ok("<html>hello</html>".into()));
         let r = run(&["http://example.com"], &mut env.ctx());
+        // Output must be byte-identical to the wifi path — programs
+        // are transport-agnostic now.
         assert_eq!(r.exit_code, 0);
-        assert!(r.output.starts_with("(via cellular)\n"));
-        assert!(r.output.contains("<html>hello</html>"));
-        // Modem was brought up as part of the fallback.
+        assert_eq!(r.output, "<html>hello</html>");
+        // Verify the fallback actually happened by inspecting modem
+        // state directly, not the output string.
         assert!(env.modem.is_powered());
         assert!(env.modem.is_data_active());
     }

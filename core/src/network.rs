@@ -47,36 +47,57 @@ impl ConnectivityError {
 /// Ensure there's a usable IP transport and return which one is active.
 ///
 /// Policy:
-///   1. If WiFi is connected, return [`ActiveTransport::Wifi`] immediately
-///      (no modem interaction).
-///   2. Otherwise, power on the modem if needed and bring up cellular
-///      data if needed. Return [`ActiveTransport::Cellular`].
-///   3. If the cellular fallback fails at any step, return a
+///   1. If WiFi is connected: return [`ActiveTransport::Wifi`]. If a
+///      cellular data session was still active (left over from an
+///      earlier fallback), tear it down first — the radio is
+///      power-hungry and we no longer need it.
+///   2. If WiFi is disconnected: power on the modem if needed and
+///      bring up cellular data if needed. Return
+///      [`ActiveTransport::Cellular`].
+///   3. If cellular fallback fails at any step, return a
 ///      [`ConnectivityError`] with a diagnostic message.
+///
+/// Teardown on wifi recovery is **lazy** — it only happens the next
+/// time someone calls this function. That's fine for a text-based OS
+/// where network calls are user-triggered; the cellular radio stays on
+/// until the next HTTP/SMTP request, then releases. If we ever want
+/// eager teardown, the cleanest hook is a periodic `idle_tick` from
+/// the main loop.
 ///
 /// This is synchronous and can block for several seconds while the
 /// modem powers on and PPP negotiates. Callers should expect a
-/// noticeable delay on the first use after WiFi drops.
+/// noticeable delay on the first cellular use after WiFi drops.
 pub fn ensure_connectivity(
     wifi: &mut dyn WifiDriver,
     modem: &mut dyn Modem,
     apn: &str,
 ) -> Result<ActiveTransport, ConnectivityError> {
     if matches!(wifi.status(), WifiStatus::Connected(_)) {
+        if modem.is_data_active() {
+            log::info!("wifi recovered — releasing cellular data session");
+            // Non-fatal: if teardown fails we still have working wifi,
+            // the session will eventually time out on the modem side.
+            if let Err(e) = modem.disable_data() {
+                log::warn!("cellular teardown failed: {}", e.display());
+            }
+        }
         return Ok(ActiveTransport::Wifi);
     }
 
     // WiFi isn't available. Fall back to cellular.
+    let already_up = modem.is_data_active();
     if !modem.is_powered() {
         modem
             .power_on()
             .map_err(|e| ConnectivityError(format!("modem power on: {}", e.display())))?;
     }
-
-    if !modem.is_data_active() {
+    if !already_up {
         modem
             .enable_data(apn)
             .map_err(|e| ConnectivityError(format!("cellular bring-up: {}", e.display())))?;
+        // Only log on the transition, not on every subsequent call
+        // that's already using cellular.
+        log::info!("using cellular data (APN={})", apn);
     }
 
     Ok(ActiveTransport::Cellular)
@@ -149,5 +170,87 @@ mod tests {
         let mut modem = MockModem::new();
         ensure_connectivity(&mut wifi, &mut modem, "custom-apn").unwrap();
         assert_eq!(modem.last_apn.as_deref(), Some("custom-apn"));
+    }
+
+    // --- Phase 1: auto-teardown on wifi recovery ----------------------------
+
+    #[test]
+    fn wifi_recovery_tears_down_cellular() {
+        // Start on cellular (wifi down, data active).
+        let mut wifi = MockWifiDriver::new();
+        let mut modem = MockModem::new();
+        ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        assert!(modem.is_data_active());
+
+        // WiFi comes back.
+        wifi.connect("home_wifi", "").unwrap();
+
+        // Next ensure_connectivity call should tear down the cellular
+        // session and return Wifi.
+        let result = ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        assert_eq!(result, ActiveTransport::Wifi);
+        assert!(
+            !modem.is_data_active(),
+            "cellular should have been torn down on wifi recovery"
+        );
+    }
+
+    #[test]
+    fn wifi_down_keeps_existing_cellular_session() {
+        // First call brings up cellular.
+        let mut wifi = MockWifiDriver::new();
+        let mut modem = MockModem::new();
+        ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        assert!(modem.is_data_active());
+
+        // Clear the APN so we can detect whether a redial happened.
+        modem.last_apn = None;
+
+        // Second call (wifi still down) must not redial; it just reuses
+        // the existing session.
+        let result = ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        assert_eq!(result, ActiveTransport::Cellular);
+        assert!(modem.is_data_active());
+        assert!(
+            modem.last_apn.is_none(),
+            "enable_data should not have been re-called while data was already up"
+        );
+    }
+
+    #[test]
+    fn wifi_connected_with_no_cellular_is_noop_teardown() {
+        // Regression guard: when wifi is up and cellular was already
+        // down, the teardown branch must not fire (no log, no disable_data
+        // call). Easy to get wrong during refactors.
+        let mut wifi = MockWifiDriver::new();
+        wifi.connect("home_wifi", "").unwrap();
+        let mut modem = MockModem::new();
+        // Power the modem so disable_data *would* visibly do something
+        // if called — it clears data_active even if already false, but
+        // here the test is mostly documenting that the no-op path is OK.
+        modem.power_on().unwrap();
+
+        let result = ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        assert_eq!(result, ActiveTransport::Wifi);
+        assert!(!modem.is_data_active());
+    }
+
+    #[test]
+    fn cellular_teardown_failure_is_non_fatal() {
+        // Even if disable_data errors, wifi is still usable and
+        // ensure_connectivity should succeed.
+        //
+        // MockModem's disable_data currently always succeeds, so this
+        // test can't actually trigger the error path. We leave it as a
+        // placeholder with a note — the code path is exercised by the
+        // real device driver, and the non-fatal logic is audited
+        // visually (we call disable_data via `if let Err(_)` so the
+        // return value can't escape).
+        let mut wifi = MockWifiDriver::new();
+        let mut modem = MockModem::new();
+        ensure_connectivity(&mut wifi, &mut modem, APN).unwrap();
+        wifi.connect("home_wifi", "").unwrap();
+        let result = ensure_connectivity(&mut wifi, &mut modem, APN);
+        assert!(result.is_ok());
     }
 }

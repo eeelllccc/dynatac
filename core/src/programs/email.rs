@@ -32,7 +32,7 @@
 
 use super::{ExecContext, ProgramResult};
 use crate::email::{Email, SmtpSession};
-use crate::network::{ensure_connectivity, ActiveTransport, APN};
+use crate::network::{ensure_connectivity, APN};
 
 const GMAIL_HOST: &str = "smtp.gmail.com";
 const GMAIL_PORT: u16 = 465;
@@ -66,13 +66,12 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
             );
         }
     };
-    // Make sure *some* IP transport is live (WiFi, or cellular as a
-    // fallback). On a cellular fallback this can take 10–20 s the first
-    // time while the modem dials in.
-    let transport = match ensure_connectivity(ctx.wifi, ctx.modem, APN) {
-        Ok(t) => t,
-        Err(e) => return ProgramResult::err(format!("no connectivity: {}", e.display())),
-    };
+    // Make sure *some* IP transport is live. Transport choice is
+    // opaque to this program — ensure_connectivity logs transitions
+    // and we just use whatever it brings up.
+    if let Err(e) = ensure_connectivity(ctx.wifi, ctx.modem, APN) {
+        return ProgramResult::err(format!("no connectivity: {}", e.display()));
+    }
     let email = Email {
         from: creds.address.clone(),
         to: to.to_string(),
@@ -84,11 +83,6 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
         Ok(s) => s,
         Err(e) => return ProgramResult::err(format!("connect: {}", e)),
     };
-    // Small visible marker so the user knows cellular fallback kicked in.
-    let transport_note = match transport {
-        ActiveTransport::Wifi => "",
-        ActiveTransport::Cellular => " (via cellular)",
-    };
     match SmtpSession::send(
         stream,
         EHLO_NAME,
@@ -96,7 +90,7 @@ fn send(to: &str, subject: &str, body: &str, ctx: &mut ExecContext) -> ProgramRe
         &creds.app_password,
         &email,
     ) {
-        Ok(()) => ProgramResult::ok(format!("sent to {}{}", to, transport_note)),
+        Ok(()) => ProgramResult::ok(format!("sent to {}", to)),
         Err(e) => ProgramResult::err(format!("send failed: {}", e)),
     }
 }
@@ -314,15 +308,11 @@ mod tests {
             &["you@example.com", "hi", "hello there"],
             &mut env.ctx(),
         );
+        // Output is byte-identical to the wifi path — programs are
+        // transport-agnostic. Verify the fallback by inspecting modem
+        // state directly.
         assert_eq!(r.exit_code, 0, "output was: {}", r.output);
-        // Success message notes the cellular path.
-        assert!(r.output.contains("sent to you@example.com"));
-        assert!(
-            r.output.contains("(via cellular)"),
-            "expected cellular marker in: {}",
-            r.output
-        );
-        // Modem was brought up as part of the fallback.
+        assert_eq!(r.output, "sent to you@example.com");
         assert!(env.modem.is_powered());
         assert!(env.modem.is_data_active());
     }
