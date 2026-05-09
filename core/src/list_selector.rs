@@ -3,6 +3,10 @@
 //! Presents a list of items with a cursor. The user navigates with
 //! `y` (up) and `h` (down), and confirms with Enter.
 //!
+//! The selector is display-aware: it only renders items that fit within
+//! `visible_rows`. The viewport scrolls automatically to keep the cursor
+//! on screen. Call `set_visible_rows` when the font size changes.
+//!
 //! Caller invariants:
 //!   - Feed key events via `handle_key`
 //!   - On `ListAction::Redraw`, call `render()` and display the result
@@ -25,16 +29,54 @@ pub struct ListSelector {
     header: String,
     items: Vec<String>,
     cursor: usize,
+    /// Total display rows available (1 for header + rest for items).
+    visible_rows: usize,
+    /// Index of the first item row currently shown.
+    viewport_offset: usize,
 }
 
 impl ListSelector {
-    /// Create a new selector. `items` must not be empty.
-    pub fn new(header: &str, items: Vec<String>) -> Self {
+    /// Create a new selector.
+    ///
+    /// `visible_rows` is the total number of display rows available to this
+    /// widget (one row is reserved for the header). Pass the current value of
+    /// `Shell::display_rows` so the selector stays in sync with the font size.
+    ///
+    /// `items` must not be empty.
+    pub fn new(header: &str, items: Vec<String>, visible_rows: usize) -> Self {
         assert!(!items.is_empty(), "ListSelector requires at least one item");
         Self {
             header: header.to_string(),
             items,
             cursor: 0,
+            visible_rows,
+            viewport_offset: 0,
+        }
+    }
+
+    /// Update the available display rows after a font-size change.
+    /// The viewport is adjusted so the cursor remains visible.
+    pub fn set_visible_rows(&mut self, rows: usize) {
+        self.visible_rows = rows;
+        self.clamp_viewport();
+    }
+
+    /// Number of item rows the viewport can show.
+    fn item_rows(&self) -> usize {
+        self.visible_rows.saturating_sub(1)
+    }
+
+    /// Scroll the viewport so the cursor is always within it.
+    fn clamp_viewport(&mut self) {
+        let n = self.item_rows();
+        if n == 0 {
+            self.viewport_offset = 0;
+            return;
+        }
+        if self.cursor < self.viewport_offset {
+            self.viewport_offset = self.cursor;
+        } else if self.cursor >= self.viewport_offset + n {
+            self.viewport_offset = self.cursor + 1 - n;
         }
     }
 
@@ -47,6 +89,7 @@ impl ListSelector {
             KeyEvent::Char('y') => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
+                    self.clamp_viewport();
                     ListAction::Redraw
                 } else {
                     ListAction::None
@@ -55,26 +98,27 @@ impl ListSelector {
             KeyEvent::Char('h') => {
                 if self.cursor + 1 < self.items.len() {
                     self.cursor += 1;
+                    self.clamp_viewport();
                     ListAction::Redraw
                 } else {
                     ListAction::None
                 }
             }
-            KeyEvent::Enter => {
-                ListAction::Selected(self.items[self.cursor].clone())
-            }
+            KeyEvent::Enter => ListAction::Selected(self.items[self.cursor].clone()),
             _ => ListAction::None,
         }
     }
 
-    /// Render the list as a multi-line string.
+    /// Render the visible portion of the list.
     /// The selected item is marked with `> `, others with `  `.
     pub fn render(&self) -> String {
-        let mut lines = Vec::with_capacity(self.items.len() + 1);
+        let n = self.item_rows();
+        let end = (self.viewport_offset + n).min(self.items.len());
+        let mut lines = Vec::with_capacity(end - self.viewport_offset + 1);
         lines.push(self.header.clone());
-        for (i, item) in self.items.iter().enumerate() {
+        for i in self.viewport_offset..end {
             let marker = if i == self.cursor { "> " } else { "  " };
-            lines.push(format!("{}{}", marker, item));
+            lines.push(format!("{}{}", marker, self.items[i]));
         }
         lines.join("\n")
     }
@@ -84,10 +128,12 @@ impl ListSelector {
 mod tests {
     use super::*;
 
+    /// Tall enough that all 3 items always fit on screen.
     fn selector() -> ListSelector {
         ListSelector::new(
             "Pick one:",
             vec!["alpha".into(), "beta".into(), "gamma".into()],
+            10,
         )
     }
 
@@ -168,6 +214,78 @@ mod tests {
     #[test]
     #[should_panic(expected = "at least one item")]
     fn empty_items_panics() {
-        ListSelector::new("header", vec![]);
+        ListSelector::new("header", vec![], 10);
+    }
+
+    // --- Viewport / scrolling tests ---
+
+    /// 3 items, only 2 rows for items (visible_rows=3: 1 header + 2 items).
+    fn tight_selector() -> ListSelector {
+        ListSelector::new(
+            "header:",
+            vec!["a".into(), "b".into(), "c".into()],
+            3, // 1 header row + 2 item rows
+        )
+    }
+
+    #[test]
+    fn viewport_shows_only_visible_rows() {
+        let sel = tight_selector();
+        let rendered = sel.render();
+        // Initial viewport: items 0..2 (a, b). c is out of view.
+        assert!(rendered.contains("> a"));
+        assert!(rendered.contains("  b"));
+        assert!(!rendered.contains("c"));
+    }
+
+    #[test]
+    fn viewport_scrolls_down_when_cursor_leaves() {
+        let mut sel = tight_selector();
+        sel.handle_key(KeyEvent::Char('h')); // cursor → b
+        sel.handle_key(KeyEvent::Char('h')); // cursor → c; viewport scrolls
+        let rendered = sel.render();
+        // Viewport now shows b, c. a is scrolled out.
+        assert!(!rendered.contains("  a"), "item a should not be visible");
+        assert!(!rendered.contains("> a"), "item a should not be visible");
+        assert!(rendered.contains("  b"));
+        assert!(rendered.contains("> c"));
+    }
+
+    #[test]
+    fn viewport_scrolls_back_up() {
+        let mut sel = tight_selector();
+        sel.handle_key(KeyEvent::Char('h'));
+        sel.handle_key(KeyEvent::Char('h')); // scroll down to show b, c
+        sel.handle_key(KeyEvent::Char('y')); // cursor → b
+        sel.handle_key(KeyEvent::Char('y')); // cursor → a; viewport scrolls back
+        let rendered = sel.render();
+        assert!(rendered.contains("> a"));
+        assert!(rendered.contains("  b"));
+        assert!(!rendered.contains("  c"), "item c should not be visible");
+        assert!(!rendered.contains("> c"), "item c should not be visible");
+    }
+
+    #[test]
+    fn set_visible_rows_adjusts_viewport_to_keep_cursor_visible() {
+        let mut sel = tight_selector();
+        sel.handle_key(KeyEvent::Char('h'));
+        sel.handle_key(KeyEvent::Char('h')); // cursor at c, viewport at b..c
+
+        // Shrink to 2 rows (1 header + 1 item). Viewport must still show cursor.
+        sel.set_visible_rows(2);
+        let rendered = sel.render();
+        assert!(rendered.contains("> c"));
+        assert!(!rendered.contains("b"));
+    }
+
+    #[test]
+    fn set_visible_rows_expand_shows_more_items() {
+        let mut sel = tight_selector();
+        // Expand to show all 3 items.
+        sel.set_visible_rows(10);
+        let rendered = sel.render();
+        assert!(rendered.contains("> a"));
+        assert!(rendered.contains("  b"));
+        assert!(rendered.contains("  c"));
     }
 }

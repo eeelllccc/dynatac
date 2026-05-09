@@ -18,6 +18,10 @@ harness = false
 name = "keyboard_terminal"
 harness = false
 
+[[example]]
+name = "list_selector_demo"
+harness = false
+
 [profile.release]
 opt-level = "s"
 

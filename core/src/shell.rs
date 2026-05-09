@@ -41,11 +41,26 @@ enum InteractiveState {
 
 pub struct Shell {
     interactive: Option<InteractiveState>,
+    /// Number of display rows available, used to size list selectors.
+    /// Update via `set_display_rows` when the font size changes.
+    pub display_rows: usize,
 }
 
 impl Shell {
     pub fn new() -> Self {
-        Self { interactive: None }
+        Self {
+            interactive: None,
+            display_rows: crate::framebuffer::HEIGHT as usize / 8,
+        }
+    }
+
+    /// Call this when the font size changes so active and future list selectors
+    /// clip correctly to the new row count.
+    pub fn set_display_rows(&mut self, rows: usize) {
+        self.display_rows = rows;
+        if let Some(InteractiveState::List(selector, _, _)) = &mut self.interactive {
+            selector.set_visible_rows(rows);
+        }
     }
 
     /// Whether the shell is in an interactive mode (list or text prompt).
@@ -193,7 +208,7 @@ impl Shell {
         if items.is_empty() {
             return ShellAction::Output("no items to select".to_string());
         }
-        let selector = ListSelector::new(&header, items);
+        let selector = ListSelector::new(&header, items, self.display_rows);
         let rendered = selector.render();
         self.interactive = Some(InteractiveState::List(selector, program_name, context));
         ShellAction::Output(rendered)
