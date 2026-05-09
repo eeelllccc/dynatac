@@ -7,6 +7,7 @@ pub mod keyboard;
 mod modem;
 mod nvs_credential_store;
 mod nvs_network_store;
+mod sdcard;
 mod sleep;
 mod smtp;
 mod wifi;
@@ -18,7 +19,7 @@ use esp_idf_svc::hal::{
     gpio::{AnyOutputPin, IOPin, OutputPin, PinDriver, Pull},
     i2c::{I2cConfig, I2cDriver},
     peripherals::Peripherals,
-    spi::{config::DriverConfig, SpiConfig, SpiDeviceDriver, SpiDriver},
+    spi::{config::DriverConfig, Dma, SpiConfig, SpiDeviceDriver, SpiDriver},
     uart::{config::Config as UartConfig, UartDriver},
     units::Hertz,
 };
@@ -67,20 +68,30 @@ fn main() {
     let pins = peripherals.pins;
 
     // --- Deselect other SPI devices on the shared bus ----------------------------
+    // Drive all CS pins high before the SPI bus is initialised so no device
+    // is accidentally selected during bus setup.
     let mut lora_cs = PinDriver::output(pins.gpio3).unwrap();
     lora_cs.set_high().unwrap();
     let mut lora_rst = PinDriver::output(pins.gpio4).unwrap();
     lora_rst.set_high().unwrap();
-    let mut sd_cs = PinDriver::output(pins.gpio48).unwrap();
-    sd_cs.set_high().unwrap();
+    {
+        // Hold SD CS high during bus init, then release ownership so the
+        // SDSPI driver can reconfigure the pin as its chip-select.
+        let mut sd_cs = PinDriver::output(pins.gpio48).unwrap();
+        sd_cs.set_high().unwrap();
+    } // sd_cs dropped here; GPIO48 is now free for sdspi_host_init_device
 
-    // --- SPI bus for EPD ---------------------------------------------------------
+    // --- SPI bus (shared: EPD, LoRa, SD card) ------------------------------------
+    // MISO (GPIO47) is needed by the SD card; the EPD only writes but having
+    // MISO configured does not affect it.
+    // DMA must be enabled: Dma::Disabled caps max_transfer_sz at 64 bytes,
+    // which is too small for the 512-byte SD card sector transfers.
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
         pins.gpio36,
         pins.gpio33,
-        None::<esp_idf_svc::hal::gpio::AnyIOPin>,
-        &DriverConfig::new(),
+        Some(pins.gpio47),
+        &DriverConfig::new().dma(Dma::Auto(4096)),
     )
     .unwrap();
 
@@ -180,6 +191,18 @@ fn main() {
     let modem_pwrkey = PinDriver::output(pins.gpio40.downgrade_output()).unwrap();
     let modem_power_en = PinDriver::output(pins.gpio41.downgrade_output()).unwrap();
     let mut modem_driver = EspA7682EModem::new(modem_uart, modem_pwrkey, modem_power_en);
+
+    // --- SD card filesystem -------------------------------------------------------
+    let _sd = match sdcard::SdCardFs::mount() {
+        Ok(fs) => {
+            log::info!("SD card mounted at /sdcard");
+            Some(fs)
+        }
+        Err(e) => {
+            log::warn!("SD card not available: {}", e);
+            None
+        }
+    };
 
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");

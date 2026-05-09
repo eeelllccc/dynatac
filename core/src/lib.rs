@@ -1,4 +1,5 @@
 pub mod battery;
+pub mod fs;
 pub mod charger;
 pub mod credentials;
 pub mod email;

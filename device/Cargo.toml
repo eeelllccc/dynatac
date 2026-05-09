@@ -22,6 +22,10 @@ harness = false
 name = "list_selector_demo"
 harness = false
 
+[[example]]
+name = "sd_card_test"
+harness = false
+
 [profile.release]
 opt-level = "s"
 

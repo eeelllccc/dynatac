@@ -89,11 +89,15 @@ impl<'d> Epd<'d> {
     }
 
     fn wait_busy(&self) {
-        sleep(Duration::from_millis(1));
-        let mut timeout_ms: u32 = 5_000;
+        // 10 ms >= one FreeRTOS tick (portTICK_PERIOD_MS=10), so usleep()
+        // calls vTaskDelay(1) instead of busy-waiting with esp_rom_delay_us.
+        // This keeps the IDLE task alive and prevents the task watchdog from
+        // firing during long full-panel refreshes (which can take >5 s).
+        sleep(Duration::from_millis(10));
+        let mut timeout_ms: u32 = 10_000;
         while self.busy.is_low() {
-            sleep(Duration::from_millis(1));
-            timeout_ms = timeout_ms.saturating_sub(1);
+            sleep(Duration::from_millis(10));
+            timeout_ms = timeout_ms.saturating_sub(10);
             if timeout_ms == 0 {
                 log::warn!("EPD BUSY timeout");
                 break;
