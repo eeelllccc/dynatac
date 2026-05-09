@@ -42,6 +42,28 @@ impl<'d> EspWifiDriver<'d> {
             connected_ssid: None,
         }
     }
+
+    /// Disconnect (if connected) and stop the WiFi radio entirely.
+    /// Used by the lockscreen path before entering light sleep so
+    /// the radio isn't drawing current while the device is locked.
+    /// Returns the first error encountered but does not abort early —
+    /// every step is best-effort.
+    pub fn shutdown_for_sleep(&mut self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        if self.connected_ssid.is_some() {
+            if let Err(e) = self.wifi.disconnect() {
+                first_err.get_or_insert(format!("disconnect error: {:?}", e));
+            }
+            self.connected_ssid = None;
+        }
+        if let Err(e) = self.wifi.stop() {
+            first_err.get_or_insert(format!("stop error: {:?}", e));
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl WifiDriver for EspWifiDriver<'_> {

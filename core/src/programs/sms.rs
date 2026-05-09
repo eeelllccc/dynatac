@@ -14,6 +14,8 @@ use crate::sms::{self, SmsMessage, SmsStatus};
 
 use super::{ExecContext, ProgramResult};
 
+pub const USAGE: &str = "sms [send <number> <body>|inbox|read <idx>|delete <idx>]";
+
 pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
     match args.first().copied() {
         Some("send") => send(&args[1..], ctx),
@@ -21,9 +23,7 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
         Some("read") => read(&args[1..], ctx),
         Some("delete") => delete(&args[1..], ctx),
         Some(other) => ProgramResult::err(format!("unknown subcommand: {}", other)),
-        None => ProgramResult::ok(
-            "usage: sms [send <number> <body>|inbox|read <idx>|delete <idx>]".to_string(),
-        ),
+        None => ProgramResult::ok(USAGE.to_string()),
     }
 }
 
@@ -132,6 +132,7 @@ fn status_marker(s: &SmsStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::battery::MockBatteryDriver;
+    use crate::charger::MockChargerDriver;
     use crate::credentials::MockCredentialStore;
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
@@ -147,6 +148,7 @@ mod tests {
         creds: MockCredentialStore,
         modem: MockModem,
         battery: MockBatteryDriver,
+        charger: MockChargerDriver,
     }
 
     impl Env {
@@ -159,6 +161,7 @@ mod tests {
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
                 battery: MockBatteryDriver::new(),
+                charger: MockChargerDriver::new(),
             };
             // SMS commands all require an active modem; default to on so
             // tests don't need to power it explicitly.
@@ -175,6 +178,7 @@ mod tests {
                 credentials: &mut self.creds,
                 modem: &mut self.modem,
                 battery: &mut self.battery,
+                charger: &mut self.charger,
             }
         }
     }
@@ -184,7 +188,7 @@ mod tests {
         let mut env = Env::new();
         let r = run(&[], &mut env.ctx());
         assert_eq!(r.exit_code, 0);
-        assert!(r.output.contains("usage"));
+        assert_eq!(r.output, USAGE);
     }
 
     #[test]

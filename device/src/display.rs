@@ -28,6 +28,7 @@ use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver};
 use esp_idf_svc::hal::sys::EspError;
 
 use dynatac_core::framebuffer::{FrameBuffer, BUF_LEN};
+use dynatac_core::lockscreen;
 
 pub use dynatac_core::framebuffer::{WIDTH, HEIGHT};
 
@@ -121,7 +122,12 @@ impl<'d> Epd<'d> {
         Ok(())
     }
 
-    fn power_on(&mut self) -> Result<(), EspError> {
+    /// Bring the panel driving voltages back up after a `power_down`.
+    /// Idempotent. Called automatically by the partial / full update
+    /// helpers, but exposed publicly so the lock/unlock path can keep
+    /// the panel powered down across light sleep and explicitly bring
+    /// it back when the user wakes the device.
+    pub fn power_on(&mut self) -> Result<(), EspError> {
         if !self.power_is_on {
             self.write_command(0x04)?;
             self.wait_busy();
@@ -242,5 +248,35 @@ impl<'d> Epd<'d> {
     /// Turn off the panel driving voltages.
     pub fn power_down(&mut self) -> Result<(), EspError> {
         self.power_off()
+    }
+
+    /// Render the lockscreen (white background + DYNATAC logo) using
+    /// a full-screen refresh. The framebuffer is left in the same
+    /// state as the displayed image so subsequent dirty-region tracking
+    /// remains correct.
+    ///
+    /// After this returns the panel is still powered on; the caller
+    /// should call `power_down` before entering light sleep.
+    pub fn present_lockscreen(&mut self) -> Result<(), EspError> {
+        // Draw into the framebuffer.
+        lockscreen::render(&mut self.fb);
+        // Drop the dirty bookkeeping — we're going to paint the whole
+        // screen with a full refresh, not a partial flush.
+        let _ = self.fb.take_dirty_region();
+
+        self.ensure_init()?;
+
+        // The full-refresh path expects both buffers (0x10 = previous,
+        // 0x13 = new) to receive a full WIDTH×HEIGHT image.
+        let mut full = vec![0u8; BUF_LEN];
+        for i in 0..BUF_LEN {
+            full[i] = self.fb.desired_byte(i);
+        }
+        self.write_command(0x10)?;
+        self.write_data(&full)?;
+        self.write_command(0x13)?;
+        self.write_data(&full)?;
+
+        self.update_full()
     }
 }

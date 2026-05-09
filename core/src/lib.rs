@@ -1,12 +1,15 @@
 pub mod battery;
+pub mod charger;
 pub mod credentials;
 pub mod email;
 pub mod framebuffer;
 pub mod http;
 pub mod keymap;
 pub mod list_selector;
+pub mod lockscreen;
 pub mod modem;
 pub mod network;
+pub mod power;
 pub mod programs;
 pub mod sms;
 pub mod saved_networks;

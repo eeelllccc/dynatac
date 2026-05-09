@@ -23,6 +23,8 @@ use crate::network::APN;
 
 use super::{ExecContext, ProgramResult};
 
+pub const USAGE: &str = "modem [status|on|off|at <cmd>|data on|data off|data status]";
+
 pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
     match args.first().copied() {
         Some("status") => status(ctx),
@@ -31,9 +33,7 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
         Some("at") => raw(&args[1..], ctx),
         Some("data") => data(&args[1..], ctx),
         Some(other) => ProgramResult::err(format!("unknown subcommand: {}", other)),
-        None => ProgramResult::ok(
-            "usage: modem [status|on|off|at <cmd>|data on|data off|data status]".to_string(),
-        ),
+        None => ProgramResult::ok(USAGE.to_string()),
     }
 }
 
@@ -159,6 +159,7 @@ fn reg_text(r: &RegistrationStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::battery::MockBatteryDriver;
+    use crate::charger::MockChargerDriver;
     use crate::credentials::MockCredentialStore;
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
@@ -174,6 +175,7 @@ mod tests {
         creds: MockCredentialStore,
         modem: MockModem,
         battery: MockBatteryDriver,
+        charger: MockChargerDriver,
     }
 
     impl Env {
@@ -186,6 +188,7 @@ mod tests {
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
                 battery: MockBatteryDriver::new(),
+                charger: MockChargerDriver::new(),
             }
         }
         fn ctx(&mut self) -> ExecContext<'_> {
@@ -198,6 +201,7 @@ mod tests {
                 credentials: &mut self.creds,
                 modem: &mut self.modem,
                 battery: &mut self.battery,
+                charger: &mut self.charger,
             }
         }
     }
@@ -207,7 +211,7 @@ mod tests {
         let mut env = Env::new();
         let r = run(&[], &mut env.ctx());
         assert_eq!(r.exit_code, 0);
-        assert!(r.output.contains("usage"));
+        assert_eq!(r.output, USAGE);
     }
 
     #[test]

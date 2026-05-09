@@ -9,6 +9,8 @@
 use crate::wifi::WifiStatus;
 use super::{ExecContext, ProgramResult};
 
+pub const USAGE: &str = "wifi [status|connect|disconnect|forget]";
+
 pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
     match args.first().copied() {
         Some("status") => status(ctx),
@@ -16,9 +18,7 @@ pub fn run(args: &[&str], ctx: &mut ExecContext) -> ProgramResult {
         Some("disconnect") => disconnect(ctx),
         Some("forget") => forget(ctx),
         Some(other) => ProgramResult::err(format!("unknown subcommand: {}", other)),
-        None => ProgramResult::ok(
-            "usage: wifi [status|connect|disconnect|forget]".to_string(),
-        ),
+        None => ProgramResult::ok(USAGE.to_string()),
     }
 }
 
@@ -112,6 +112,7 @@ mod tests {
     use super::*;
     use crate::battery::MockBatteryDriver;
     use crate::credentials::MockCredentialStore;
+    use crate::charger::MockChargerDriver;
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
     use crate::modem::MockModem;
@@ -126,6 +127,7 @@ mod tests {
         creds: MockCredentialStore,
         modem: MockModem,
         battery: MockBatteryDriver,
+        charger: MockChargerDriver,
     }
 
     impl Env {
@@ -138,6 +140,7 @@ mod tests {
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
                 battery: MockBatteryDriver::new(),
+                charger: MockChargerDriver::new(),
             }
         }
         fn ctx(&mut self) -> ExecContext<'_> {
@@ -150,6 +153,7 @@ mod tests {
                 credentials: &mut self.creds,
                 modem: &mut self.modem,
                 battery: &mut self.battery,
+                charger: &mut self.charger,
             }
         }
     }
@@ -158,7 +162,8 @@ mod tests {
     fn no_args_shows_usage() {
         let mut env = Env::new();
         let r = run(&[], &mut env.ctx());
-        assert!(r.output.contains("usage:"));
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.output, USAGE);
     }
 
     #[test]

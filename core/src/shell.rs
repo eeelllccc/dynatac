@@ -20,6 +20,13 @@ pub enum ShellAction {
     Output(String),
     /// Clear the terminal screen.
     Clear,
+    /// Enter deep sleep. The device wakes on physical button press (CHIP_PU reset).
+    /// The main loop renders progress messages and shuts down peripherals before sleeping.
+    PowerOff,
+    /// Enter BQ25896 ship mode. The battery is disconnected; only USB can restore power.
+    /// The main loop renders progress messages and shuts down peripherals before calling
+    /// the charger's `shutdown`.
+    ShipMode,
 }
 
 /// Which interactive mode the shell is in.
@@ -160,6 +167,12 @@ impl Shell {
         for program in PROGRAMS {
             if program.name == cmd {
                 let result = (program.run)(args, ctx);
+                if result.output == "__POWER_OFF__" {
+                    return ShellAction::PowerOff;
+                }
+                if result.output == "__SHIP_MODE__" {
+                    return ShellAction::ShipMode;
+                }
                 if result.output.starts_with("__START_LIST__\n") {
                     return self.start_list(&result.output, program.name);
                 }
@@ -280,6 +293,7 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::battery::MockBatteryDriver;
+    use crate::charger::MockChargerDriver;
     use crate::credentials::{CredentialStore, MockCredentialStore};
     use crate::email::MockSmtpStreamFactory;
     use crate::http::MockHttpClient;
@@ -295,6 +309,7 @@ mod tests {
         creds: MockCredentialStore,
         modem: MockModem,
         battery: MockBatteryDriver,
+        charger: MockChargerDriver,
     }
 
     impl Env {
@@ -307,6 +322,7 @@ mod tests {
                 creds: MockCredentialStore::new(),
                 modem: MockModem::new(),
                 battery: MockBatteryDriver::new(),
+                charger: MockChargerDriver::new(),
             }
         }
         fn ctx(&mut self) -> ExecContext<'_> {
@@ -319,6 +335,7 @@ mod tests {
                 credentials: &mut self.creds,
                 modem: &mut self.modem,
                 battery: &mut self.battery,
+                charger: &mut self.charger,
             }
         }
     }
@@ -327,6 +344,8 @@ mod tests {
         match action {
             ShellAction::Output(s) => s,
             ShellAction::Clear => panic!("expected Output, got Clear"),
+            ShellAction::PowerOff => panic!("expected Output, got PowerOff"),
+            ShellAction::ShipMode => panic!("expected Output, got ShipMode"),
         }
     }
 
@@ -353,6 +372,47 @@ mod tests {
         let mut env = Env::new();
         let mut ctx = env.ctx();
         assert_eq!(output(s.execute("nosuch", &mut ctx)), "unknown command: nosuch");
+    }
+
+    #[test]
+    fn power_off_returns_power_off_action() {
+        let mut s = Shell::new();
+        let mut env = Env::new();
+        let mut ctx = env.ctx();
+        assert!(matches!(
+            s.execute("power off", &mut ctx),
+            ShellAction::PowerOff
+        ));
+    }
+
+    #[test]
+    fn power_ship_confirm_returns_ship_mode_action() {
+        let mut s = Shell::new();
+        let mut env = Env::new();
+        let mut ctx = env.ctx();
+        assert!(matches!(
+            s.execute("power ship confirm", &mut ctx),
+            ShellAction::ShipMode
+        ));
+    }
+
+    #[test]
+    fn power_ship_without_confirm_shows_warning() {
+        let mut s = Shell::new();
+        let mut env = Env::new();
+        let mut ctx = env.ctx();
+        let text = output(s.execute("power ship", &mut ctx));
+        assert!(text.contains("USB"));
+        assert!(text.contains("power ship confirm"));
+    }
+
+    #[test]
+    fn power_with_no_args_shows_usage_not_shutdown() {
+        let mut s = Shell::new();
+        let mut env = Env::new();
+        let mut ctx = env.ctx();
+        let text = output(s.execute("power", &mut ctx));
+        assert!(text.contains("power off"));
     }
 
     #[test]

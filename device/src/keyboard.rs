@@ -64,6 +64,13 @@ impl<'a, 'd> Keyboard<'a, 'd> {
         self.mapper.sym_on()
     }
 
+    /// Reset all modifier toggles (Shift, Sym, Alt) to off. Called by
+    /// the lockscreen path so modifier presses during the locked state
+    /// don't leak through to the post-unlock terminal.
+    pub fn clear_modifiers(&mut self) {
+        self.mapper.clear_modifiers();
+    }
+
     /// Poll the FIFO for one key-press event.
     pub fn poll(&mut self) -> Result<Option<KeyEvent>, EspError> {
         loop {

@@ -123,6 +123,18 @@ const FONT_8X8: [[u8; 8]; 96] = [
   /* 0x7F DEL  */ [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
 ];
 
+/// Look up the 8×8 glyph for an ASCII character. Returns 8 rows, each
+/// a byte where bit 7 is the leftmost pixel and 1 means black. Returns
+/// `None` for characters outside `0x20..=0x7F`.
+pub fn glyph_8x8(ch: char) -> Option<[u8; 8]> {
+    let code = ch as usize;
+    if (0x20..=0x7F).contains(&code) {
+        Some(FONT_8X8[code - 0x20])
+    } else {
+        None
+    }
+}
+
 /// The region that changed since the last flush.
 ///
 /// `x`, `y`, `w`, `h` are in pixels (x and w are multiples of 8).
@@ -193,6 +205,41 @@ impl FrameBuffer {
             }
         }
         self.mark_dirty(x as u16 & 0xFFF8, y, 8, 8);
+    }
+
+    /// Fill an axis-aligned rectangle in the desired buffer.
+    ///
+    /// `on` = true draws black; false draws white. Coordinates are in
+    /// pixels and may be unaligned. The dirty region is expanded to an
+    /// 8-pixel column boundary so the partial flush stays well-formed.
+    pub fn fill_rect(&mut self, x: u16, y: u16, w: u16, h: u16, on: bool) {
+        if w == 0 || h == 0 || x >= WIDTH || y >= HEIGHT {
+            return;
+        }
+        let x_end = (x + w).min(WIDTH);
+        let y_end = (y + h).min(HEIGHT);
+        for py in y..y_end {
+            for px in x..x_end {
+                let byte_idx = (py as usize) * BYTES_PER_ROW + (px as usize / 8);
+                let bit = 7 - (px % 8) as u8;
+                if on {
+                    self.desired[byte_idx] &= !(1u8 << bit); // black
+                } else {
+                    self.desired[byte_idx] |= 1u8 << bit;    // white
+                }
+            }
+        }
+        // Expand dirty bbox to 8-aligned bytes for partial-flush safety.
+        let aligned_x = x & 0xFFF8;
+        let aligned_w = ((x_end - aligned_x + 7) & 0xFFF8).max(8);
+        self.mark_dirty(aligned_x, y, aligned_w, y_end - y);
+    }
+
+    /// Clear the entire desired buffer to white. Marks the full display
+    /// dirty so the next flush repaints everything.
+    pub fn clear_all_desired(&mut self) {
+        self.desired.fill(0xFF);
+        self.mark_dirty(0, 0, WIDTH, HEIGHT);
     }
 
     /// Clear the 8-pixel-tall strip at row `y` across the full display width.

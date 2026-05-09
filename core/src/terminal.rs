@@ -182,6 +182,10 @@ impl Terminal {
                 self.scroll_offset = 0;
                 TerminalAction::Redraw
             }
+            // Lock is intercepted by the main loop before it reaches
+            // the terminal, but we still need an arm so the match is
+            // exhaustive.
+            KeyEvent::Lock => TerminalAction::None,
         }
     }
 

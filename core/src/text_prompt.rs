@@ -66,13 +66,15 @@ impl TextPrompt {
                 }
             }
             KeyEvent::Enter => TextPromptAction::Submitted(self.input.clone()),
-            // Cancel is intercepted by the shell before it ever reaches
-            // the prompt, but we still need an arm so the match is exhaustive.
+            // Cancel and Lock are intercepted by the shell / main loop
+            // before they ever reach the prompt, but we still need arms
+            // so the match is exhaustive.
             KeyEvent::SoftEnter
             | KeyEvent::Cancel
             | KeyEvent::ScrollUp
             | KeyEvent::ScrollDown
-            | KeyEvent::ScrollBottom => TextPromptAction::None,
+            | KeyEvent::ScrollBottom
+            | KeyEvent::Lock => TextPromptAction::None,
         }
     }
 

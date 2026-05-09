@@ -64,6 +64,9 @@ pub enum KeyEvent {
     ScrollDown,
     /// Jump to the bottom of output (Alt + b).
     ScrollBottom,
+    /// Lock the device (Alt + l). Routed to the power state machine,
+    /// not the terminal.
+    Lock,
 }
 
 /// Platform-independent key mapper and modifier state machine.
@@ -98,6 +101,15 @@ impl KeyMapper {
     /// Whether the Alt toggle is currently active.
     pub fn alt_on(&self) -> bool {
         self.alt_on
+    }
+
+    /// Force all modifier toggles off. Used by the lockscreen path so
+    /// stray Shift / Sym / Alt presses while locked don't surface as
+    /// stuck modifiers after unlock.
+    pub fn clear_modifiers(&mut self) {
+        self.shift_on = false;
+        self.sym_on = false;
+        self.alt_on = false;
     }
 
     /// Process a raw key event from the hardware.
@@ -172,6 +184,13 @@ impl KeyMapper {
                         'y' => return Some(KeyEvent::ScrollUp),
                         'h' => return Some(KeyEvent::ScrollDown),
                         'b' => return Some(KeyEvent::ScrollBottom),
+                        'l' => {
+                            // Alt+L → lock. Auto-clear Alt so the next
+                            // press after unlock isn't accidentally an
+                            // Alt-action.
+                            self.alt_on = false;
+                            return Some(KeyEvent::Lock);
+                        }
                         _ => {}
                     }
                 }
@@ -322,6 +341,39 @@ mod tests {
         km.process(2, 0, true); // Alt on
         // 'b' is row=2, col=5
         assert_eq!(km.process(2, 5, true), Some(KeyEvent::ScrollBottom));
+    }
+
+    #[test]
+    fn clear_modifiers_resets_all_three() {
+        let mut km = KeyMapper::new();
+        km.process(3, 5, true); // Shift on
+        km.process(3, 8, true); // Sym on
+        km.process(2, 0, true); // Alt on
+        assert!(km.shift_on() && km.sym_on() && km.alt_on());
+
+        km.clear_modifiers();
+        assert!(!km.shift_on() && !km.sym_on() && !km.alt_on());
+
+        // Subsequent letter press is unmodified.
+        assert_eq!(km.process(0, 0, true), Some(KeyEvent::Char('q')));
+    }
+
+    #[test]
+    fn alt_l_produces_lock_and_clears_alt() {
+        let mut km = KeyMapper::new();
+        km.process(2, 0, true); // Alt on
+        // 'l' is row=1, col=8
+        assert_eq!(km.process(1, 8, true), Some(KeyEvent::Lock));
+        // Alt auto-cleared so the next 'l' is a normal letter.
+        assert!(!km.alt_on());
+        assert_eq!(km.process(1, 8, true), Some(KeyEvent::Char('l')));
+    }
+
+    #[test]
+    fn bare_l_is_normal_letter() {
+        let mut km = KeyMapper::new();
+        // Without Alt, 'l' is just 'l'.
+        assert_eq!(km.process(1, 8, true), Some(KeyEvent::Char('l')));
     }
 
     #[test]
