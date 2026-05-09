@@ -1,20 +1,27 @@
-//! Persistent storage for application credentials (currently: Gmail).
+//! Persistent storage for application credentials (Gmail, WhatsApp bridge).
 //!
 //! The [`CredentialStore`] trait abstracts over the storage backend.
 //! [`MockCredentialStore`] is the in-memory implementation used by tests;
 //! the device builds a real one on top of NVS.
 //!
 //! Store invariants:
-//!   - `set_gmail()` overwrites any existing entry.
-//!   - `gmail()` returns `None` until something has been stored.
-//!   - The store does not validate addresses or password format — it just
-//!     persists whatever the caller hands it.
+//!   - `set_*()` overwrites any existing entry.
+//!   - `gmail()` / `whatsapp()` return `None` until something has been stored.
+//!   - The store does not validate values — it persists whatever the caller
+//!     hands it.
 
 /// A configured Gmail account: full address + 16-char Google App Password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmailCreds {
     pub address: String,
     pub app_password: String,
+}
+
+/// Credentials for the WhatsApp bridge server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatsappCreds {
+    pub base_url: String,
+    pub bearer_token: String,
 }
 
 /// Persistence backend for application credentials.
@@ -25,16 +32,22 @@ pub trait CredentialStore {
     fn set_gmail(&mut self, address: &str, app_password: &str) -> Result<(), String>;
     /// Forget the configured Gmail account. No-op if none is set.
     fn clear_gmail(&mut self) -> Result<(), String>;
+
+    /// Look up the configured WhatsApp bridge credentials, if any.
+    fn whatsapp(&self) -> Option<WhatsappCreds>;
+    /// Save (or overwrite) the WhatsApp bridge credentials.
+    fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String>;
 }
 
 /// In-memory implementation for tests.
 pub struct MockCredentialStore {
     gmail: Option<GmailCreds>,
+    whatsapp: Option<WhatsappCreds>,
 }
 
 impl MockCredentialStore {
     pub fn new() -> Self {
-        Self { gmail: None }
+        Self { gmail: None, whatsapp: None }
     }
 }
 
@@ -57,6 +70,17 @@ impl CredentialStore for MockCredentialStore {
     }
     fn clear_gmail(&mut self) -> Result<(), String> {
         self.gmail = None;
+        Ok(())
+    }
+
+    fn whatsapp(&self) -> Option<WhatsappCreds> {
+        self.whatsapp.clone()
+    }
+    fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String> {
+        self.whatsapp = Some(WhatsappCreds {
+            base_url: base_url.to_string(),
+            bearer_token: bearer_token.to_string(),
+        });
         Ok(())
     }
 }

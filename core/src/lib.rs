@@ -6,6 +6,7 @@ pub mod framebuffer;
 pub mod http;
 pub mod keymap;
 pub mod list_selector;
+pub mod scroll_view;
 pub mod lockscreen;
 pub mod modem;
 pub mod network;

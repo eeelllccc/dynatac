@@ -20,6 +20,7 @@ pub mod modem;
 pub mod net;
 pub mod power;
 pub mod sms;
+pub mod whatsapp;
 pub mod wifi;
 
 /// Ambient state available to every program (clock, drivers, etc.).
@@ -146,6 +147,14 @@ pub static PROGRAMS: &[Program] = &[
         run: sms::run,
         on_list_select: None,
         on_text_submit: None,
+        usage_on_empty: true,
+    },
+    Program {
+        name: "whatsapp",
+        usage: whatsapp::USAGE,
+        run: whatsapp::run,
+        on_list_select: Some(whatsapp::on_list_select),
+        on_text_submit: Some(whatsapp::on_text_submit),
         usage_on_empty: true,
     },
     Program {

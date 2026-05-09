@@ -309,18 +309,23 @@ impl Terminal {
     }
 }
 
-/// Wrap a string into chunks of at most `cols` characters.
+/// Wrap a string into chunks of at most `cols` Unicode characters.
 fn wrap(s: &str, cols: usize) -> Vec<String> {
     if s.is_empty() {
         return vec![String::new()];
     }
     let mut rows = Vec::new();
     let mut remaining = s;
-    while remaining.len() > cols {
-        rows.push(remaining[..cols].to_string());
-        remaining = &remaining[cols..];
+    while !remaining.is_empty() {
+        // Find the byte index of the `cols`-th character (or end of string).
+        let split = remaining
+            .char_indices()
+            .nth(cols)
+            .map(|(i, _)| i)
+            .unwrap_or(remaining.len());
+        rows.push(remaining[..split].to_string());
+        remaining = &remaining[split..];
     }
-    rows.push(remaining.to_string());
     rows
 }
 

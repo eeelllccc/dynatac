@@ -8,3 +8,5 @@ edition = "2021"
 # host tests). The device binary registers EspLogger at boot, at which
 # point log calls from core route to the esp-idf console.
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

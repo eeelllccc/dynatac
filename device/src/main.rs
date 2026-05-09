@@ -187,6 +187,7 @@ fn main() {
 
     let mut term = Terminal::new("> ", TERM_COLS, TERM_ROWS);
     let mut shell = Shell::new();
+    shell.set_display_rows(TERM_ROWS);
     let mut power = Power::new();
     let boot = std::time::Instant::now();
 

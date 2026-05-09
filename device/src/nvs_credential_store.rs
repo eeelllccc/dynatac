@@ -8,13 +8,15 @@
 //! enabled, NVS encryption will protect them transparently — same trust
 //! model as the WiFi credential store next door.
 
-use dynatac_core::credentials::{CredentialStore, GmailCreds};
+use dynatac_core::credentials::{CredentialStore, GmailCreds, WhatsappCreds};
 
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
 const NAMESPACE: &str = "app_creds";
 const KEY_ADDR: &str = "gmail_addr";
 const KEY_PW: &str = "gmail_pw";
+const KEY_WA_URL: &str = "wa_url";
+const KEY_WA_TOKEN: &str = "wa_token";
 
 /// Max length of a single NVS string value we read.
 const MAX_NVS_STR_LEN: usize = 256;
@@ -61,6 +63,22 @@ impl CredentialStore for NvsCredentialStore {
     fn clear_gmail(&mut self) -> Result<(), String> {
         let _ = self.nvs.remove(KEY_ADDR);
         let _ = self.nvs.remove(KEY_PW);
+        Ok(())
+    }
+
+    fn whatsapp(&self) -> Option<WhatsappCreds> {
+        let base_url = self.get_str(KEY_WA_URL)?;
+        let bearer_token = self.get_str(KEY_WA_TOKEN)?;
+        Some(WhatsappCreds { base_url, bearer_token })
+    }
+
+    fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String> {
+        self.nvs
+            .set_str(KEY_WA_URL, base_url)
+            .map_err(|e| format!("nvs set {}: {:?}", KEY_WA_URL, e))?;
+        self.nvs
+            .set_str(KEY_WA_TOKEN, bearer_token)
+            .map_err(|e| format!("nvs set {}: {:?}", KEY_WA_TOKEN, e))?;
         Ok(())
     }
 }

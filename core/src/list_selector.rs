@@ -27,7 +27,11 @@ pub enum ListAction {
 
 pub struct ListSelector {
     header: String,
+    /// Display strings shown on screen.
     items: Vec<String>,
+    /// Values returned by `ListAction::Selected`. Always the same length as
+    /// `items`. When constructed via `new`, values == items.
+    values: Vec<String>,
     cursor: usize,
     /// Total display rows available (1 for header + rest for items).
     visible_rows: usize,
@@ -43,11 +47,38 @@ impl ListSelector {
     /// `Shell::display_rows` so the selector stays in sync with the font size.
     ///
     /// `items` must not be empty.
+    /// Create a selector where the displayed text and selection value are the
+    /// same string (the common case for SSIDs, commands, etc.).
     pub fn new(header: &str, items: Vec<String>, visible_rows: usize) -> Self {
         assert!(!items.is_empty(), "ListSelector requires at least one item");
+        let values = items.clone();
         Self {
             header: header.to_string(),
             items,
+            values,
+            cursor: 0,
+            visible_rows,
+            viewport_offset: 0,
+        }
+    }
+
+    /// Create a selector where the displayed text and the value returned on
+    /// selection are different. Each tuple is `(display, value)`.
+    ///
+    /// Use this when the display string needs to be short (to avoid wrapping)
+    /// but the selection value needs to carry more information (e.g. a full
+    /// JID or path).
+    pub fn new_with_values(
+        header: &str,
+        items: Vec<(String, String)>,
+        visible_rows: usize,
+    ) -> Self {
+        assert!(!items.is_empty(), "ListSelector requires at least one item");
+        let (displays, values): (Vec<_>, Vec<_>) = items.into_iter().unzip();
+        Self {
+            header: header.to_string(),
+            items: displays,
+            values,
             cursor: 0,
             visible_rows,
             viewport_offset: 0,
@@ -104,7 +135,7 @@ impl ListSelector {
                     ListAction::None
                 }
             }
-            KeyEvent::Enter => ListAction::Selected(self.items[self.cursor].clone()),
+            KeyEvent::Enter => ListAction::Selected(self.values[self.cursor].clone()),
             _ => ListAction::None,
         }
     }

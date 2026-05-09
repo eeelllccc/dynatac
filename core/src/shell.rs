@@ -11,6 +11,7 @@
 use crate::keymap::KeyEvent;
 use crate::list_selector::{ListAction, ListSelector};
 use crate::programs::{ExecContext, PROGRAMS};
+use crate::scroll_view::{ScrollAction, ScrollStart, ScrollView};
 use crate::text_prompt::{TextPrompt, TextPromptAction};
 
 /// What the caller should do after a command executes.
@@ -37,6 +38,8 @@ enum InteractiveState {
     /// Typing into a text prompt. Carries the program name and context
     /// from the previous step (e.g. the selected SSID).
     TextPrompt(TextPrompt, &'static str, String),
+    /// Read-only scrollable pager. No program callbacks; `q` or Cancel exits.
+    Scroll(ScrollView),
 }
 
 pub struct Shell {
@@ -58,8 +61,10 @@ impl Shell {
     /// clip correctly to the new row count.
     pub fn set_display_rows(&mut self, rows: usize) {
         self.display_rows = rows;
-        if let Some(InteractiveState::List(selector, _, _)) = &mut self.interactive {
-            selector.set_visible_rows(rows);
+        match &mut self.interactive {
+            Some(InteractiveState::List(selector, _, _)) => selector.set_visible_rows(rows),
+            Some(InteractiveState::Scroll(view)) => view.set_visible_rows(rows),
+            _ => {}
         }
     }
 
@@ -123,6 +128,16 @@ impl Shell {
                     TextPromptAction::None => ShellAction::Output(String::new()),
                 }
             }
+            Some(InteractiveState::Scroll(view)) => {
+                match view.handle_key(key) {
+                    ScrollAction::Redraw => ShellAction::Output(view.render()),
+                    ScrollAction::Exit => {
+                        self.interactive = None;
+                        ShellAction::Output(String::new())
+                    }
+                    ScrollAction::None => ShellAction::Output(String::new()),
+                }
+            }
             None => ShellAction::Output(String::new()),
         }
     }
@@ -142,6 +157,9 @@ impl Shell {
                     let result = handler(context, item, ctx);
                     if result.output.starts_with("__START_TEXT_PROMPT__\n") {
                         return self.start_text_prompt(&result.output, program_name);
+                    }
+                    if result.output.starts_with("__START_SCROLL__\n") {
+                        return self.start_scroll(&result.output);
                     }
                     return ShellAction::Output(result.output);
                 }
@@ -171,6 +189,9 @@ impl Shell {
                     if result.output.starts_with("__START_LIST__\n") {
                         return self.start_list(&result.output, program_name);
                     }
+                    if result.output.starts_with("__START_SCROLL__\n") {
+                        return self.start_scroll(&result.output);
+                    }
                     return ShellAction::Output(result.output);
                 }
             }
@@ -191,8 +212,14 @@ impl Shell {
                 if result.output.starts_with("__START_LIST__\n") {
                     return self.start_list(&result.output, program.name);
                 }
+                if result.output.starts_with("__START_LIST_VALUED__\n") {
+                    return self.start_list_valued(&result.output, program.name);
+                }
                 if result.output.starts_with("__START_TEXT_PROMPT__\n") {
                     return self.start_text_prompt(&result.output, program.name);
+                }
+                if result.output.starts_with("__START_SCROLL__\n") {
+                    return self.start_scroll(&result.output);
                 }
                 return ShellAction::Output(result.output);
             }
@@ -211,6 +238,62 @@ impl Shell {
         let selector = ListSelector::new(&header, items, self.display_rows);
         let rendered = selector.render();
         self.interactive = Some(InteractiveState::List(selector, program_name, context));
+        ShellAction::Output(rendered)
+    }
+
+    /// Signal format:
+    /// ```text
+    /// __START_LIST_VALUED__
+    /// <context>
+    /// <header>
+    /// <display1>\t<value1>
+    /// <display2>\t<value2>
+    /// ...
+    /// ```
+    /// `display` is shown on screen; `value` is what `on_list_select` receives.
+    fn start_list_valued(&mut self, output: &str, program_name: &'static str) -> ShellAction {
+        let mut lines = output.lines().skip(1); // skip __START_LIST_VALUED__
+        let context = lines.next().unwrap_or("").to_string();
+        let header = lines.next().unwrap_or("").to_string();
+        let items: Vec<(String, String)> = lines
+            .map(|l| {
+                if let Some((display, value)) = l.split_once('\t') {
+                    (display.to_string(), value.to_string())
+                } else {
+                    (l.to_string(), l.to_string())
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            return ShellAction::Output("no items to select".to_string());
+        }
+        let selector = ListSelector::new_with_values(&header, items, self.display_rows);
+        let rendered = selector.render();
+        self.interactive = Some(InteractiveState::List(selector, program_name, context));
+        ShellAction::Output(rendered)
+    }
+
+    /// Signal format:
+    /// ```text
+    /// __START_SCROLL__
+    /// top|bottom        // starting position
+    /// <line1>
+    /// <line2>
+    /// ...
+    /// ```
+    fn start_scroll(&mut self, output: &str) -> ShellAction {
+        let mut lines_iter = output.lines().skip(1); // skip __START_SCROLL__
+        let start = match lines_iter.next().unwrap_or("top") {
+            "bottom" => ScrollStart::Bottom,
+            _ => ScrollStart::Top,
+        };
+        let content: Vec<String> = lines_iter.map(|l| l.to_string()).collect();
+        if content.is_empty() {
+            return ShellAction::Output("(empty)".to_string());
+        }
+        let view = ScrollView::new(content, self.display_rows, start);
+        let rendered = view.render();
+        self.interactive = Some(InteractiveState::Scroll(view));
         ShellAction::Output(rendered)
     }
 
