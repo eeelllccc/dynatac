@@ -80,6 +80,11 @@ struct Chat {
 }
 
 #[derive(Deserialize)]
+struct GroupParticipants {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct Message {
     sender_jid: Option<String>,
     content: Option<String>,
@@ -123,14 +128,16 @@ fn inbox(ctx: &mut ExecContext) -> ProgramResult {
 
     // Each item: "display\tvalue" where display is short (fits one screen line)
     // and value is the full JID passed back to on_list_select.
-    let items: Vec<String> = chats
-        .iter()
-        .filter(|c| c.jid != "status@broadcast")
-        .map(|c| {
-            let display = chat_display_name(c);
-            format!("{}\t{}", display, c.jid)
-        })
-        .collect();
+    let mut items: Vec<String> = Vec::new();
+    for c in chats.iter().filter(|c| c.jid != "status@broadcast") {
+        let display = if c.jid.ends_with("@g.us") {
+            fetch_group_name(&creds.base_url, &creds.bearer_token, &c.jid, ctx.http)
+                .unwrap_or_else(|| chat_display_name(c))
+        } else {
+            chat_display_name(c)
+        };
+        items.push(format!("{}\t{}", display, c.jid));
+    }
 
     if items.is_empty() {
         return ProgramResult::ok("no chats".into());
@@ -253,17 +260,30 @@ fn on_token_submit(base_url: &str, text: &str, ctx: &mut ExecContext) -> Program
 
 // --- helpers ----------------------------------------------------------------
 
+/// Fetch the authoritative group name from the bridge's group participants endpoint.
+/// Returns `None` if the request fails or the name is empty.
+fn fetch_group_name(
+    base_url: &str,
+    token: &str,
+    jid: &str,
+    http: &mut dyn crate::http::HttpClient,
+) -> Option<String> {
+    let url = format!("{}/group/participants?group_id={}", base_url, jid);
+    let body = http.get_with_bearer(&url, token).ok()?;
+    let parsed: ApiResponse<GroupParticipants> = serde_json::from_str(&body).ok()?;
+    if parsed.code != "SUCCESS" {
+        return None;
+    }
+    parsed.results.map(|g| g.name).filter(|n| !n.is_empty())
+}
+
 /// Short display name for a chat — shown in the list selector.
 /// The full JID is passed separately as the selection value.
 fn chat_display_name(chat: &Chat) -> String {
-    if chat.jid.ends_with("@g.us") {
-        // Group: show name if available, else the numeric ID.
-        let fallback = chat.jid.split('@').next().unwrap_or(&chat.jid);
-        chat.name.as_deref().unwrap_or(fallback).to_string()
-    } else {
-        // Private: phone number (first part of JID).
-        chat.jid.split('@').next().unwrap_or(&chat.jid).to_string()
+    if let Some(name) = chat.name.as_deref().filter(|s| !s.is_empty()) {
+        return name.to_string();
     }
+    chat.jid.split('@').next().unwrap_or(&chat.jid).to_string()
 }
 
 /// Format a message as [header_line, body_line].
@@ -370,11 +390,16 @@ mod tests {
     }
 
     fn chat_list_json() -> &'static str {
+        // Group name is null here — the real name comes from /group/participants.
         r#"{"code":"SUCCESS","message":"ok","results":{"data":[
             {"jid":"447807555187@s.whatsapp.net","name":"Alice"},
-            {"jid":"120363420474396842@g.us","name":"Family"},
+            {"jid":"120363420474396842@g.us","name":null},
             {"jid":"status@broadcast","name":null}
         ],"pagination":{"limit":50,"offset":0,"total":3}}}"#
+    }
+
+    fn group_participants_json() -> &'static str {
+        r#"{"code":"SUCCESS","message":"ok","results":{"name":"Family"}}"#
     }
 
     fn messages_json() -> &'static str {
@@ -412,12 +437,16 @@ mod tests {
             &format!("{BASE_URL}/chats?limit=50"),
             Ok(chat_list_json().into()),
         );
+        env.http.on_get_with_bearer(
+            &format!("{BASE_URL}/group/participants?group_id=120363420474396842@g.us"),
+            Ok(group_participants_json().into()),
+        );
         let r = run(&["inbox"], &mut env.ctx());
         assert_eq!(r.exit_code, 0, "output: {}", r.output);
         assert!(r.output.starts_with("__START_LIST_VALUED__\ninbox\nWhatsApp:"));
-        // Private chat: display is phone number, value is full JID
-        assert!(r.output.contains("447807555187\t447807555187@s.whatsapp.net"));
-        // Group chat: display is just the name, value is full JID
+        // Private chat: display is contact name, value is full JID
+        assert!(r.output.contains("Alice\t447807555187@s.whatsapp.net"));
+        // Group chat: display is name from /group/participants, value is full JID
         assert!(r.output.contains("Family\t120363420474396842@g.us"));
         // status@broadcast filtered out
         assert!(!r.output.contains("status@broadcast"));
@@ -553,8 +582,14 @@ mod tests {
     // --- helpers ---
 
     #[test]
-    fn chat_display_name_private() {
+    fn chat_display_name_private_with_name() {
         let chat = Chat { jid: "447807555187@s.whatsapp.net".into(), name: Some("Alice".into()) };
+        assert_eq!(chat_display_name(&chat), "Alice");
+    }
+
+    #[test]
+    fn chat_display_name_private_no_name() {
+        let chat = Chat { jid: "447807555187@s.whatsapp.net".into(), name: None };
         assert_eq!(chat_display_name(&chat), "447807555187");
     }
 
