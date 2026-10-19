@@ -18,6 +18,7 @@ pub mod echo;
 pub mod email;
 pub mod modem;
 pub mod net;
+pub mod phone;
 pub mod power;
 pub mod sms;
 pub mod whatsapp;
@@ -132,6 +133,14 @@ pub static PROGRAMS: &[Program] = &[
         on_list_select: None,
         on_text_submit: None,
         usage_on_empty: false, // no-args runs status, not usage
+    },
+    Program {
+        name: "phone",
+        usage: phone::USAGE,
+        run: phone::run,
+        on_list_select: None,
+        on_text_submit: None,
+        usage_on_empty: true,
     },
     Program {
         name: "power",

@@ -167,6 +167,17 @@ impl ModemError {
     }
 }
 
+/// An unsolicited event that can arrive during an active voice call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallUrc {
+    /// The call ended (remote hung up, or carrier lost).
+    NoCarrier,
+    /// The remote party is busy.
+    Busy,
+    /// Any other URC line received during the call.
+    Other(String),
+}
+
 /// High-level interface to a cellular modem.
 pub trait Modem {
     /// Power on the modem and wait until it responds to `AT` with `OK`.

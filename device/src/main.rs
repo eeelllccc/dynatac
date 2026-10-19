@@ -13,7 +13,7 @@ mod smtp;
 mod wifi;
 
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::{
     gpio::{AnyOutputPin, IOPin, OutputPin, PinDriver, Pull},
@@ -301,6 +301,7 @@ fn main() {
                                     &mut charger,
                                 );
                             }
+                            ShellAction::CallActive(_) => {}
                         }
                         // Exited list mode — restore input line
                         if was_interactive && !shell.is_interactive() {
@@ -358,6 +359,21 @@ fn main() {
                                             &mut charger,
                                         );
                                     }
+                                    ShellAction::CallActive(number) => {
+                                        term.set_show_input(false);
+                                        term.push_output(&format!("calling {}...", number));
+                                        term.push_output(dynatac_core::call::HELP);
+                                        render_terminal(&mut epd, &term);
+                                        flush(&mut epd);
+                                        handle_call(
+                                            &mut epd,
+                                            &mut term,
+                                            &mut modem_driver,
+                                            &mut kb,
+                                            &number,
+                                        );
+                                        term.set_show_input(true);
+                                    }
                                 }
                                 needs_redraw = true;
                             }
@@ -380,6 +396,100 @@ fn main() {
 
         sleep(Duration::from_millis(10));
     }
+}
+
+/// Block until the voice call ends (user presses Enter or remote hangs up).
+///
+/// Shows a volume status line, updated in place, which u/d step up and down.
+/// The level shown is read back from the modem, so it confirms that `phone`
+/// started the call at max volume.
+///
+/// Displays "hung up (MM:SS)" or "call ended (MM:SS)" / "busy" and re-renders
+/// before returning. The caller is responsible for restoring terminal state.
+fn handle_call(
+    epd: &mut Epd,
+    term: &mut Terminal,
+    modem: &mut EspA7682EModem,
+    kb: &mut Keyboard,
+    number: &str,
+) {
+    use dynatac_core::call::{self, CallKey};
+    use dynatac_core::modem::CallUrc;
+    let _ = number; // shown by the caller before entering
+    let call_start = Instant::now();
+
+    let (mut volume, mut confirmed) = match query_volume(modem) {
+        Some(v) => (v, true),
+        None => (call::Volume::max(), false),
+    };
+    term.push_output(&call::status_line(volume, confirmed));
+    render_terminal(epd, term);
+    flush(epd);
+
+    loop {
+        // URCs are polled before handling keys: sending a volume command
+        // drains the UART, so a pending NO CARRIER must be consumed first.
+        match modem.poll_urc() {
+            Some(CallUrc::NoCarrier) => {
+                let secs = call_start.elapsed().as_secs();
+                term.push_output(&format!(
+                    "call ended ({:02}:{:02})",
+                    secs / 60,
+                    secs % 60
+                ));
+                render_terminal(epd, term);
+                flush(epd);
+                return;
+            }
+            Some(CallUrc::Busy) => {
+                term.push_output("busy");
+                render_terminal(epd, term);
+                flush(epd);
+                return;
+            }
+            Some(CallUrc::Other(_)) | None => {}
+        }
+
+        let target = match kb.poll() {
+            Ok(Some(event)) => match call::classify_key(&event) {
+                CallKey::HangUp => break,
+                CallKey::VolumeUp => Some(volume.up()),
+                CallKey::VolumeDown => Some(volume.down()),
+                CallKey::Ignore => None,
+            },
+            Ok(None) | Err(_) => None,
+        };
+        if let Some(target) = target {
+            let r = modem.send_raw_with_timeout(&target.set_command(), Duration::from_secs(1));
+            log::info!("{}: {:?}", target.set_command(), r);
+            (volume, confirmed) = match query_volume(modem) {
+                Some(v) => (v, true),
+                None => (target, false),
+            };
+            term.replace_last_output(&call::status_line(volume, confirmed));
+            render_terminal(epd, term);
+            flush(epd);
+        }
+
+        sleep(Duration::from_millis(50));
+    }
+
+    // User pressed Enter — hang up.
+    let _ = modem.send_raw("AT+CHUP");
+    let _ = modem.send_raw("ATH");
+    let secs = call_start.elapsed().as_secs();
+    term.push_output(&format!("hung up ({:02}:{:02})", secs / 60, secs % 60));
+    render_terminal(epd, term);
+    flush(epd);
+}
+
+/// Read the current call volume back from the modem. `None` if the query
+/// fails or the response doesn't parse.
+fn query_volume(modem: &mut EspA7682EModem) -> Option<dynatac_core::call::Volume> {
+    use dynatac_core::call;
+    let r = modem.send_raw_with_timeout(call::QUERY_COMMAND, Duration::from_secs(1));
+    log::info!("{}: {:?}", call::QUERY_COMMAND, r);
+    r.ok().and_then(|lines| call::parse_query(&lines))
 }
 
 /// Owns the entire locked-state lifecycle. Paints the lockscreen,

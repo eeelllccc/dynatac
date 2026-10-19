@@ -28,6 +28,10 @@ pub enum ShellAction {
     /// The main loop renders progress messages and shuts down peripherals before calling
     /// the charger's `shutdown`.
     ShipMode,
+    /// A voice call has been successfully initiated to the given number.
+    /// The main loop should enter a blocking in-call state (display timer,
+    /// poll for hang-up key and modem URCs) and hang up when done.
+    CallActive(String),
 }
 
 /// Which interactive mode the shell is in.
@@ -220,6 +224,10 @@ impl Shell {
                 }
                 if result.output.starts_with("__START_SCROLL__\n") {
                     return self.start_scroll(&result.output);
+                }
+                if result.output.starts_with("__CALL_ACTIVE__\n") {
+                    let number = result.output["__CALL_ACTIVE__\n".len()..].trim().to_string();
+                    return ShellAction::CallActive(number);
                 }
                 return ShellAction::Output(result.output);
             }
@@ -444,6 +452,7 @@ mod tests {
             ShellAction::Clear => panic!("expected Output, got Clear"),
             ShellAction::PowerOff => panic!("expected Output, got PowerOff"),
             ShellAction::ShipMode => panic!("expected Output, got ShipMode"),
+            ShellAction::CallActive(_) => panic!("expected Output, got CallActive"),
         }
     }
 

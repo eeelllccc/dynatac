@@ -62,7 +62,7 @@ use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dynatac_core::modem::{
-    classify, prefer_registered, rssi_index_to_dbm, AtEvent, AtParser, LineClass, Modem,
+    classify, prefer_registered, rssi_index_to_dbm, AtEvent, AtParser, CallUrc, LineClass, Modem,
     ModemError, ModemStatus, RegistrationStatus, SimStatus,
 };
 use esp_idf_svc::hal::{
@@ -230,7 +230,7 @@ impl<'d> EspA7682EModem<'d> {
         }
     }
 
-    fn send_raw_with_timeout(
+    pub fn send_raw_with_timeout(
         &mut self,
         cmd: &str,
         timeout: Duration,
@@ -487,6 +487,36 @@ impl<'d> EspA7682EModem<'d> {
                 Err(ModemError::Io(format!("ppp up timeout: {:?}", e)))
             }
         }
+    }
+
+    /// Non-blocking poll for unsolicited result codes during an active voice
+    /// call. Reads whatever bytes are waiting in the UART FIFO (returns
+    /// immediately if there are none) and returns the first recognisable
+    /// call-related URC, or `None` if nothing interesting arrived.
+    ///
+    /// Caller invariant: must only be called while the modem is in voice-call
+    /// command mode (i.e. between a successful `ATD…;` and `ATH`). Do not
+    /// call while a data session is active.
+    pub fn poll_urc(&mut self) -> Option<CallUrc> {
+        let mut buf = [0u8; 256];
+        let n = match self.uart.read(&mut buf, 0) {
+            Ok(n) if n > 0 => n,
+            _ => return None,
+        };
+        for event in self.parser.feed(&buf[..n]) {
+            if let AtEvent::Line(line) = event {
+                let trimmed = line.trim();
+                if trimmed == "BUSY" {
+                    return Some(CallUrc::Busy);
+                }
+                match classify(trimmed) {
+                    LineClass::NoCarrier => return Some(CallUrc::NoCarrier),
+                    LineClass::Echo | LineClass::Info => {}
+                    _ => return Some(CallUrc::Other(line)),
+                }
+            }
+        }
+        None
     }
 
     /// Send the `+++` escape sequence to return the modem from data mode

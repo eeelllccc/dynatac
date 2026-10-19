@@ -26,6 +26,22 @@ harness = false
 name = "sd_card_test"
 harness = false
 
+[[example]]
+name = "audio_probe"
+harness = false
+
+[[example]]
+name = "headset_mic_test"
+harness = false
+
+[[example]]
+name = "mic_gain_sweep"
+harness = false
+
+[[example]]
+name = "call_test"
+harness = false
+
 [profile.release]
 opt-level = "s"
 

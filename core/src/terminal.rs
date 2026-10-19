@@ -199,6 +199,17 @@ impl Terminal {
         self.scroll_offset = 0;
     }
 
+    /// Replace the most recent output line, for status that updates in place
+    /// (e.g. call volume). Pushes the line if there is no output yet.
+    /// `text` should be a single line; newlines are not split.
+    pub fn replace_last_output(&mut self, text: &str) {
+        match self.lines.last_mut() {
+            Some(last) => *last = text.to_string(),
+            None => self.lines.push(text.to_string()),
+        }
+        self.scroll_offset = 0;
+    }
+
     /// Wrap all scrollback lines to the terminal width.
     fn wrapped_output(&self) -> Vec<String> {
         let mut output_wrapped: Vec<String> = Vec::new();
@@ -478,6 +489,27 @@ mod tests {
         assert_eq!(row_text(&cells, (R - 1) as u8), "> _");
         assert_eq!(row_text(&cells, (R - 2) as u8), "ok");
         assert_eq!(row_text(&cells, (R - 3) as u8), "> cmd");
+    }
+
+    #[test]
+    fn replace_last_output_overwrites_in_place() {
+        let mut term = term();
+        term.push_output("calling 123...");
+        term.push_output("vol 7 (max=7)");
+        term.replace_last_output("vol 6 (max=7)");
+
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "vol 6 (max=7)");
+        assert_eq!(row_text(&cells, (R - 3) as u8), "calling 123...");
+    }
+
+    #[test]
+    fn replace_last_output_on_empty_pushes() {
+        let mut term = term();
+        term.replace_last_output("status");
+
+        let cells = term.render();
+        assert_eq!(row_text(&cells, (R - 2) as u8), "status");
     }
 
     // Step 8: Output wrapping
