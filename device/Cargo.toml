@@ -42,6 +42,10 @@ harness = false
 name = "call_test"
 harness = false
 
+[[example]]
+name = "modem_capture"
+harness = false
+
 [profile.release]
 opt-level = "s"
 

@@ -30,6 +30,7 @@ const REG_CFG: u8 = 0x01;
 const REG_INT_STAT: u8 = 0x02;
 const REG_KEY_LCK_EC: u8 = 0x03;
 const REG_KEY_EVENT_A: u8 = 0x04;
+const REG_GPIO_DAT_STAT_1: u8 = 0x14;
 const REG_KP_GPIO_1: u8 = 0x1D;
 const REG_KP_GPIO_2: u8 = 0x1E;
 
@@ -52,6 +53,33 @@ impl<'a, 'd> Keyboard<'a, 'd> {
         kb.configure_matrix()?;
         kb.flush()?;
         Ok(kb)
+    }
+
+    /// Whether the TCA8418 still holds the matrix configuration written by
+    /// `new()`. A power glitch resets the chip to defaults (keypad disabled),
+    /// after which `poll` returns `Ok(None)` forever without any error.
+    pub fn is_configured(&mut self) -> Result<bool, EspError> {
+        let row_mask: u8 = (1 << ROWS) - 1;
+        Ok(self.read_reg(REG_CFG)? == 0x01 && self.read_reg(REG_KP_GPIO_1)? == row_mask)
+    }
+
+    /// Raw status registers for diagnostics, as `[INT_STAT, KEY_LCK_EC,
+    /// GPIO_DAT_STAT1, GPIO_DAT_STAT2, GPIO_DAT_STAT3]`. Does not consume
+    /// FIFO events.
+    pub fn status_regs(&mut self) -> Result<[u8; 5], EspError> {
+        Ok([
+            self.read_reg(REG_INT_STAT)?,
+            self.read_reg(REG_KEY_LCK_EC)?,
+            self.read_reg(REG_GPIO_DAT_STAT_1)?,
+            self.read_reg(REG_GPIO_DAT_STAT_1 + 1)?,
+            self.read_reg(REG_GPIO_DAT_STAT_1 + 2)?,
+        ])
+    }
+
+    /// Re-apply the matrix configuration and flush the FIFO, as `new()` does.
+    pub fn reinit(&mut self) -> Result<(), EspError> {
+        self.configure_matrix()?;
+        self.flush()
     }
 
     /// Whether the Shift toggle is currently active.

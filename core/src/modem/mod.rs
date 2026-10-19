@@ -24,6 +24,7 @@
 //!     modem is powered off.
 
 pub mod at;
+pub mod trace;
 
 pub use at::{classify, AtEvent, AtParser, LineClass, Urc};
 
