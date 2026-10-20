@@ -25,7 +25,7 @@
 //     are delivered before the loss marker (they were received first).
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::{
     delay::TickType,
@@ -35,7 +35,7 @@ use esp_idf_svc::hal::{
 };
 use esp_idf_svc::sys::EspError;
 
-use dynatac_core::modem::transport::{rx_pipe, Rx, RxReader, RxWriter, Transport, WriteError};
+use dynatac_core::modem::transport::{rx_pipe, Clock, Rx, RxReader, RxWriter, Transport, WriteError};
 
 /// Driver ring buffer: bytes waiting for the reader thread. The thread
 /// empties it every few ms, so this only needs to cover scheduling hiccups.
@@ -49,6 +49,8 @@ const DRAIN_INTERVAL_MS: u64 = 10;
 pub struct UartTransport {
     tx: UartTxDriver<'static>,
     rx: RxReader,
+    /// Origin of this transport's `Clock`.
+    epoch: Instant,
 }
 
 impl UartTransport {
@@ -74,7 +76,7 @@ impl UartTransport {
             .stack_size(6 * 1024)
             .spawn(move || reader_loop(rx_driver, writer))
             .expect("spawn modem-rx thread");
-        Ok(Self { tx, rx: reader })
+        Ok(Self { tx, rx: reader, epoch: Instant::now() })
     }
 
     /// The two directions, for callers that send and receive on
@@ -91,6 +93,13 @@ impl Transport for UartTransport {
 
     fn read(&mut self, timeout: Duration) -> Option<Rx> {
         self.rx.read(timeout)
+    }
+}
+
+/// Milliseconds since the transport started.
+impl Clock for UartTransport {
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
     }
 }
 

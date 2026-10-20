@@ -28,7 +28,9 @@ pub mod driver;
 pub mod hal;
 pub mod link;
 pub mod port;
+pub mod power;
 pub mod request;
+pub mod service;
 /// Byte-level A7682E simulator: test builds only.
 #[cfg(test)]
 pub(crate) mod sim;

@@ -76,6 +76,8 @@ traces; "t+" is relative to the triggering event.
   the command, and **`CHUP`'s own `OK` comes last, after `NO CARRIER`**. So `NO CARRIER`
   during `CHUP` is a URC, not the final code. The capture tool's `is_final` (and the old
   driver) get this wrong; the L1 per-command final-code sets fix it.
+- Hardware check 2026-10-20: on a local hang-up, `+CLCC` stat 6 once came 60 ms *before*
+  `+CGEV: NW DEACT`. So the bearer-down URC races the call-state URC too.
 - Afterwards `AT+CLCC` returns a bare `OK`.
 
 ### Incoming calls (`07`, `08`)
@@ -83,6 +85,8 @@ traces; "t+" is relative to the triggering event.
   Later rings, every 6.0 s: `RING` + `+CLIP` only.
 - `ATA` → `+CGEV: NW ACT` → `VOICE CALL: BEGIN` + `+CLCC` stat 0 → **`OK` last**, ~0.7 s
   after the command. Again URCs inside a reply.
+  (Hardware check 2026-10-20: the bearer URC also came *after* `ATA`'s `OK` once, so it races
+  like the `ATD` one.)
 - Missed (caller gives up): one burst `+CLCC` stat 6 + `VOICE CALL: END` (**no duration**)
   + `NO CARRIER`. No `+CGEV` (no bearer was set up).
 - `AT+CLCC` while ringing returns the stat 4 line, as expected.

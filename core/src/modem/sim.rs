@@ -13,6 +13,9 @@
 //!     sequence, `VOICE CALL: BEGIN` + `+CLCC` + `+COLP` on connect, the
 //!     local hang-up sequence with `OK` *last*, remote hang-up, incoming
 //!     calls (`RING` + `+CLIP` every 6 s, first one followed by `+CLCC`),
+//!     `AT+CLIP` answering `ERROR` until `+CPIN: READY` (hardware check:
+//!     it failed ~0.5 s after `*ATREADY` and succeeded right after
+//!     `+CPIN: READY`),
 //!     `ATA` with `OK` last, missed calls (`VOICE CALL: END` without a
 //!     duration), soft power-off (`+CGEV: ME DETACH` only), a hard cut
 //!     (silence), `AT+CLCC=1` → `ERROR`.
@@ -114,6 +117,7 @@ struct Call {
 enum Effect {
     Emit(Vec<u8>),
     Booted,
+    SimReady,
     /// The modem finished the current command and takes the next.
     Finish,
     Dialling,
@@ -145,6 +149,8 @@ pub struct Sim {
     /// Sent chunks, with the time each went out.
     rx: VecDeque<(Millis, Vec<u8>)>,
     call: Option<Call>,
+    /// `+CPIN: READY` has been sent this boot.
+    sim_ready: bool,
 }
 
 fn lines(ls: &[&str]) -> Vec<u8> {
@@ -171,6 +177,7 @@ impl Sim {
             now: 0,
             rx: VecDeque::new(),
             call: None,
+            sim_ready: false,
         }
     }
 
@@ -186,6 +193,9 @@ impl Sim {
         for &(after, line) in BOOT {
             if line == "*ATREADY: 1" {
                 self.at(after, Effect::Booted);
+            }
+            if line == "+CPIN: READY" {
+                self.at(after, Effect::SimReady);
             }
             self.at(after, Effect::Emit(lines(&[line])));
         }
@@ -357,11 +367,13 @@ impl Sim {
         self.line.clear();
         self.busy = false;
         self.call = None;
+        self.sim_ready = false;
     }
 
     fn apply(&mut self, effect: Effect) {
         match effect {
             Effect::Emit(b) => self.emit(b),
+            Effect::SimReady => self.sim_ready = true,
             Effect::Booted => {
                 self.power = Power::On;
                 self.settings = self.settings.after_boot();
@@ -480,6 +492,7 @@ impl Sim {
             }
             "AT+CMEE?" => return reply(self, 15, &[&format!("+CMEE: {}", self.settings.cmee)]),
             "AT+CVHU?" => return reply(self, 15, &[&format!("+CVHU: {}", self.settings.cvhu)]),
+            "AT+CLIP?" | "AT+CLIP=0" | "AT+CLIP=1" if !self.sim_ready => return error(self),
             "AT+CLIP?" => return reply(self, 15, &[&format!("+CLIP: {},1", self.settings.clip)]),
             "AT+COUTGAIN?" => return reply(self, 15, &[&format!("+COUTGAIN: {}", self.settings.gain)]),
             "AT+CLCC=1" => return error(self),
@@ -745,6 +758,20 @@ mod tests {
                 "+CVHU: 1", "OK", "+CLIP: 1,1", "OK", "+COUTGAIN: 7", "OK"
             ]
         );
+    }
+
+    #[test]
+    fn caller_id_setting_fails_until_the_sim_is_ready() {
+        let mut sim = Sim::new(SimConfig::default());
+        sim.power_on(0);
+        sim.advance(6100); // *ATREADY out, +CPIN not yet
+        let mut r = Rig { sim, parser: AtParser::new() };
+        r.lines();
+        r.send("AT+CLIP=1");
+        assert_eq!(r.wait(100), ["AT+CLIP=1", "ERROR"]);
+        r.wait(3000); // +CPIN: READY
+        r.send("AT+CLIP=1");
+        assert_eq!(r.wait(200), ["AT+CLIP=1", "OK"]);
     }
 
     #[test]

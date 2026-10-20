@@ -15,6 +15,12 @@
 //!   - `*ATREADY: 1` means the modem rebooted: [`Event::Restarted`], the
 //!     link is reset (anything in flight settles as `Unknown`), then
 //!     resync and reconfigure as above.
+//!   - Configuration usually runs mid-boot (~1 s after `*ATREADY`), before
+//!     the SIM is ready, and SIM-dependent settings (`AT+CLIP`) answer
+//!     `ERROR` then (seen on hardware). So if a pass had issues, it is
+//!     re-run at each boot milestone (`+CPIN: READY`, `SMS DONE`,
+//!     `PB DONE`), each followed by a fresh `Configured`. Each milestone
+//!     arrives once per boot, so re-runs are bounded.
 //!
 //! Invariants (callee):
 //!   - Every submitted request gets exactly one [`Output::Done`].
@@ -108,6 +114,11 @@ enum Pending {
 pub struct Hal {
     engine: Engine,
     phase: Phase,
+    /// The last configuration pass reported issues: re-run it at the next
+    /// boot milestone.
+    retry_config: bool,
+    /// A milestone arrived mid-pass: start again when this pass ends.
+    rerun_pending: bool,
     steps: Vec<(Request, Option<Response>)>,
     queue: VecDeque<(RequestId, Request)>,
     in_flight: Option<(CommandId, Pending)>,
@@ -121,6 +132,8 @@ impl Hal {
         Self {
             engine: Engine::off(unsolicited::is_urc),
             phase: Phase::Off,
+            retry_config: false,
+            rerun_pending: false,
             steps: config_steps(),
             queue: VecDeque::new(),
             in_flight: None,
@@ -219,7 +232,18 @@ impl Hal {
                     self.phase = Phase::Syncing;
                     self.engine.reset(now);
                 }
-                u => self.event(Event::Urc(u)),
+                u => {
+                    let milestone = matches!(&u, Unsolicited::SmsReady | Unsolicited::PhonebookReady)
+                        || u == Unsolicited::Sim("READY".into());
+                    self.event(Event::Urc(u));
+                    if milestone && self.retry_config {
+                        match self.phase {
+                            Phase::Ready => self.phase = Phase::Configuring { step: 0, issues: Vec::new() },
+                            Phase::Configuring { .. } => self.rerun_pending = true,
+                            Phase::Off | Phase::Syncing => {}
+                        }
+                    }
+                }
             },
             link::Output::Event(LinkEvent::Synced) => {
                 if !matches!(self.phase, Phase::Off) {
@@ -291,6 +315,11 @@ impl Hal {
                     self.in_flight = Some((cid, Pending::Config(i)));
                 } else {
                     let issues = std::mem::take(issues);
+                    self.retry_config = !issues.is_empty();
+                    if std::mem::take(&mut self.rerun_pending) && self.retry_config {
+                        self.phase = Phase::Configuring { step: 0, issues: Vec::new() };
+                        return true;
+                    }
                     self.phase = Phase::Ready;
                     self.event(Event::Configured { issues });
                 }
@@ -625,5 +654,67 @@ mod tests {
                 (c, Err(RequestError::NotSent)),
             ]
         );
+    }
+
+    /// Seen on hardware: configuration runs before the SIM is ready and
+    /// `AT+CLIP` fails; it is retried at the next boot milestone.
+    #[test]
+    fn sim_dependent_settings_are_retried_at_boot_milestones() {
+        fn sim_not_ready(cmd: &str) -> &'static str {
+            match cmd {
+                "AT+CLIP=1" | "AT+CLIP?" => "\r\nERROR\r\n",
+                c => healthy(c),
+            }
+        }
+        let mut r = Rig::new();
+        r.power_on();
+        r.answer("\r\nOK\r\n");
+        r.advance(QUIET_MS);
+        r.configure_with(sim_not_ready);
+        assert_eq!(
+            r.events,
+            [Event::Configured { issues: vec!["AT+CLIP=1: Error".into(), "AT+CLIP?: Error".into()] }]
+        );
+        r.events.clear();
+        let id = r.submit(Request::ListCalls);
+        r.answer("\r\nOK\r\n"); // requests flow meanwhile
+        assert_eq!(r.dones, [(id, Ok(Response::Calls(vec![])))]);
+        r.rx("\r\n+CPIN: READY\r\n");
+        assert_eq!(r.writes, ["ATE0"], "re-run from the top");
+        r.configure_with(healthy);
+        assert_eq!(r.events, [Event::Urc(Unsolicited::Sim("READY".into())), Event::Configured { issues: vec![] }]);
+        r.events.clear();
+        r.rx("\r\nSMS DONE\r\n\r\nPB DONE\r\n");
+        assert!(r.writes.is_empty(), "no re-run once clean");
+        assert_eq!(r.events, [Event::Urc(Unsolicited::SmsReady), Event::Urc(Unsolicited::PhonebookReady)]);
+    }
+
+    #[test]
+    fn milestone_during_a_pass_reruns_it_after() {
+        fn sim_not_ready(cmd: &str) -> &'static str {
+            match cmd {
+                "AT+CLIP=1" | "AT+CLIP?" => "\r\nERROR\r\n",
+                c => healthy(c),
+            }
+        }
+        let mut r = Rig::new();
+        r.power_on();
+        r.answer("\r\nOK\r\n");
+        r.advance(QUIET_MS);
+        r.configure_with(sim_not_ready); // first pass: issues, retry armed
+        r.events.clear();
+        r.rx("\r\n+CPIN: READY\r\n"); // second pass starts
+        r.answer("\r\nOK\r\n"); // ATE0
+        r.rx("\r\nSMS DONE\r\n"); // milestone mid-pass
+        // Answer the rest of the second pass (still failing): it reruns
+        // instead of reporting.
+        for _ in 1..config_steps().len() {
+            let cmd = r.writes.front().cloned().unwrap();
+            r.answer(sim_not_ready(&cmd));
+        }
+        assert!(!r.events.iter().any(|e| matches!(e, Event::Configured { .. })));
+        assert_eq!(r.writes, ["ATE0"]);
+        r.configure_with(healthy);
+        assert_eq!(r.events.last(), Some(&Event::Configured { issues: vec![] }));
     }
 }

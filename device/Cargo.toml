@@ -69,3 +69,7 @@ embuild = "0.33"
 [[example]]
 name = "transport_soak"
 harness = false
+
+[[example]]
+name = "modem_hal_check"
+harness = false

@@ -20,8 +20,9 @@ impl Stack {
     fn configured() -> Self {
         let mut s = Stack { hal: Hal::new(), t: SimTransport::new(Sim::new(SimConfig::default())), out: vec![] };
         s.power_on();
-        s.until(30_000, |o| matches!(o, Output::Event(Event::Configured { .. })));
-        assert!(s.out.contains(&Output::Event(Event::Configured { issues: vec![] })), "{:#?}", s.out);
+        // The first pass runs before the SIM is ready (CLIP fails); the
+        // re-run at `+CPIN: READY` is clean.
+        s.until(30_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
         s.out.clear();
         s
     }
@@ -80,6 +81,24 @@ impl Stack {
 fn configures_the_modem_after_power_on() {
     let s = Stack::configured();
     assert_eq!(s.t.sim.gain(), 7);
+}
+
+/// As on hardware: the first configuration pass runs before the SIM is
+/// ready, so caller ID fails; the pass re-runs at `+CPIN: READY`.
+#[test]
+fn caller_id_is_configured_once_the_sim_is_ready() {
+    let mut s = Stack { hal: Hal::new(), t: SimTransport::new(Sim::new(SimConfig::default())), out: vec![] };
+    s.power_on();
+    let first = s.until(30_000, |o| matches!(o, Output::Event(Event::Configured { .. })));
+    assert_eq!(
+        first,
+        Output::Event(Event::Configured { issues: vec!["AT+CLIP=1: Error".into(), "AT+CLIP?: Error".into()] })
+    );
+    s.until(10_000, |o| *o == Output::Event(Event::Urc(Unsolicited::Sim("READY".into()))));
+    s.until(5_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
+    let now = s.t.now();
+    s.t.sim.incoming_call("07700900123", now);
+    s.until(1000, |o| matches!(o, Output::Event(Event::Urc(Unsolicited::CallerId { .. }))));
 }
 
 #[test]
