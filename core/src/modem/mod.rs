@@ -24,9 +24,11 @@
 //!     modem is powered off.
 
 pub mod at;
+pub mod driver;
 pub mod hal;
 pub mod link;
 pub mod request;
+pub mod sim;
 pub mod trace;
 pub mod unsolicited;
 pub mod transport;

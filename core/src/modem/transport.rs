@@ -52,6 +52,12 @@ pub trait Transport {
     fn read(&mut self, timeout: Duration) -> Option<Rx>;
 }
 
+/// A monotonic clock in milliseconds, for driving the pure layers above
+/// (the device uses real time, tests the simulator's clock).
+pub trait Clock {
+    fn now(&self) -> u64;
+}
+
 /// Bounded FIFO of received bytes with loss markers.
 ///
 /// Holds at most `capacity` bytes. Bytes pushed when it is full are dropped
