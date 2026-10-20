@@ -195,6 +195,7 @@ impl MockHal {
             R::QueryVerboseErrors => Response::Setting(2),
             R::QueryVoiceHangUp => Response::Setting(0),
             R::QueryCallerId => Response::Setting(1),
+            R::QueryUrcDelay => Response::Setting(0),
             R::Identify => Response::Lines(vec!["Model: A7682E".into()]),
             R::Firmware => Response::Firmware("A011B15A7682M7".into()),
             R::Dial(_)
@@ -204,7 +205,8 @@ impl MockHal {
             | R::EchoOff
             | R::SetVerboseErrors
             | R::SetVoiceHangUp
-            | R::SetCallerId => Response::Done,
+            | R::SetCallerId
+            | R::ClearUrcDelay => Response::Done,
         }
     }
 }

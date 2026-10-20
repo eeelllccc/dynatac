@@ -18,7 +18,9 @@
 //!     `+CPIN: READY`),
 //!     `ATA` with `OK` last, missed calls (`VOICE CALL: END` without a
 //!     duration), soft power-off (`+CGEV: ME DETACH` only), a hard cut
-//!     (silence), `AT+CLCC=1` → `ERROR`.
+//!     (silence), `AT+CLCC=1` → `ERROR`, `AT+CURCD` write / read-back and
+//!     the combined probe line `AT+CURCD=<n>,1;+CURCD?` (from the
+//!     `curcd_probe` hardware check, incl. before the SIM is ready).
 //!   - From the manual, not captured: `NO_SAVE` settings (`ATE`, `CMEE`,
 //!     `CVHU`) reset on boot while `AUTO_SAVE` ones (`CLIP`, `COUTGAIN`)
 //!     persist; `ATH` ignored for voice unless `AT+CVHU=0`; `ATA` with no
@@ -26,7 +28,8 @@
 //!   - Guesses (no source; revisit if captured): hanging up a call that
 //!     was never answered ends with `VOICE CALL: END` without a duration;
 //!     rejecting a ringing call with `AT+CHUP` looks like a missed call;
-//!     the modem ignores input until `*ATREADY`; unknown commands →
+//!     the modem ignores input until `*ATREADY`; ESC and Ctrl-Z outside
+//!     SMS input are ignored; unknown commands →
 //!     `ERROR`; `ATD` with a call already present → `ERROR`.
 //!
 //! The network and the far end are inputs, not modelled behaviour: dial
@@ -72,12 +75,30 @@ pub struct SimConfig {
     /// dialling at +2.2 s, alerting at +3.3 s (typical of the captures).
     /// The far end still never answers on its own.
     pub auto_network: bool,
+    /// With `auto_network`: bearer-up URC this long after `ATD` (its `OK`
+    /// is at 520 ms). Captured on both sides of the `OK`.
+    pub dial_bearer_ms: Millis,
+    /// With `auto_network`: bearer-up URC this long after `ATA` (`BEGIN`
+    /// at 716 ms, `OK` at 727 ms). Captured before `BEGIN` and after `OK`.
+    pub answer_bearer_ms: Millis,
+    /// On hang-up, bearer-down before `+CLCC` stat 6 (as captured 8×);
+    /// `false` for the order seen once on hardware.
+    pub bearer_down_first: bool,
 }
 
 impl Default for SimConfig {
     fn default() -> Self {
-        Self { auto_network: true }
+        Self { auto_network: true, dial_bearer_ms: 560, answer_bearer_ms: 528, bearer_down_first: true }
     }
+}
+
+/// What a chunk the simulator sent was, for test oracles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Unsolicited (boot lines, call progress, rings …).
+    Urc,
+    /// Part of a command's reply, or its echo.
+    Reply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,13 +115,16 @@ struct Settings {
     cvhu: u8,
     clip: u8,
     gain: u8,
+    /// `AT+CURCD` URC delay (ms). Stored and read back; the delay itself
+    /// is not modelled.
+    curcd: u16,
 }
 
 impl Settings {
     /// Defaults of the `NO_SAVE` settings after boot; `AUTO_SAVE` ones
     /// (`clip`, `gain`) keep their stored values.
     fn after_boot(self) -> Self {
-        Settings { echo: true, cmee: 0, cvhu: 1, ..self }
+        Settings { echo: true, cmee: 0, cvhu: 1, curcd: 0, ..self }
     }
 }
 
@@ -115,7 +139,8 @@ struct Call {
 
 #[derive(Debug)]
 enum Effect {
-    Emit(Vec<u8>),
+    Urc(Vec<u8>),
+    Reply(Vec<u8>),
     Booted,
     SimReady,
     /// The modem finished the current command and takes the next.
@@ -147,7 +172,7 @@ pub struct Sim {
     seq: u64,
     now: Millis,
     /// Sent chunks, with the time each went out.
-    rx: VecDeque<(Millis, Vec<u8>)>,
+    rx: VecDeque<(Millis, Origin, Vec<u8>)>,
     call: Option<Call>,
     /// `+CPIN: READY` has been sent this boot.
     sim_ready: bool,
@@ -168,7 +193,7 @@ impl Sim {
         Sim {
             cfg,
             power: Power::Off,
-            settings: Settings { echo: true, cmee: 0, cvhu: 1, clip: 0, gain: 4 },
+            settings: Settings { echo: true, cmee: 0, cvhu: 1, clip: 0, gain: 4, curcd: 0 },
             line: Vec::new(),
             commands: VecDeque::new(),
             busy: false,
@@ -197,7 +222,7 @@ impl Sim {
             if line == "+CPIN: READY" {
                 self.at(after, Effect::SimReady);
             }
-            self.at(after, Effect::Emit(lines(&[line])));
+            self.at(after, Effect::Urc(lines(&[line])));
         }
     }
 
@@ -208,7 +233,7 @@ impl Sim {
             return;
         }
         self.shut_down();
-        self.at(DETACH_AFTER, Effect::Emit(lines(&["+CGEV: ME DETACH"])));
+        self.at(DETACH_AFTER, Effect::Urc(lines(&["+CGEV: ME DETACH"])));
     }
 
     /// POWER_EN cut at `now`: instant silence, nothing in transit survives.
@@ -244,8 +269,8 @@ impl Sim {
         c.active_since = Some(now);
         let clcc = clcc_line(c);
         let colp = format!("+COLP: \"{}\",{}", c.number, number_type(&c.number));
-        self.at(0, Effect::Emit(lines(&["VOICE CALL: BEGIN", &clcc])));
-        self.at(15, Effect::Emit(lines(&[&colp])));
+        self.at(0, Effect::Urc(lines(&["VOICE CALL: BEGIN", &clcc])));
+        self.at(15, Effect::Urc(lines(&[&colp])));
     }
 
     /// The far end hung up (or, for a ringing incoming call, gave up).
@@ -276,7 +301,7 @@ impl Sim {
         let clcc = clcc_line(&c);
         self.call = Some(c);
         self.apply(Effect::Ring);
-        self.at(40, Effect::Emit(lines(&[&clcc])));
+        self.at(40, Effect::Urc(lines(&[&clcc])));
     }
 
     // --- UART -------------------------------------------------------------
@@ -294,10 +319,11 @@ impl Sim {
                     continue;
                 }
                 if self.settings.echo {
-                    self.at(ECHO_AFTER, Effect::Emit(format!("{cmd}\r").into_bytes()));
+                    self.at(ECHO_AFTER, Effect::Reply(format!("{cmd}\r").into_bytes()));
                 }
                 self.commands.push_back(cmd);
-            } else if b != b'\n' {
+            } else if b != b'\n' && b != 0x1B && b != 0x1A {
+                // ESC / Ctrl-Z outside SMS input: ignored (guess).
                 self.line.push(b);
             }
         }
@@ -317,12 +343,17 @@ impl Sim {
 
     /// The next chunk the modem has sent (by the last `advance`).
     pub fn take_rx(&mut self) -> Option<Vec<u8>> {
-        self.rx.pop_front().map(|(_, b)| b)
+        self.rx.pop_front().map(|(_, _, b)| b)
     }
 
     /// As `take_rx`, with the time the chunk went out.
     pub fn take_rx_timed(&mut self) -> Option<(Millis, Vec<u8>)> {
-        self.rx.pop_front()
+        self.rx.pop_front().map(|(t, _, b)| (t, b))
+    }
+
+    /// As `take_rx`, with what the chunk was (for test oracles).
+    pub fn take_rx_tagged(&mut self) -> Option<(Origin, Vec<u8>)> {
+        self.rx.pop_front().map(|(_, o, b)| (o, b))
     }
 
     /// When something is next due, if anything is.
@@ -332,6 +363,16 @@ impl Sim {
 
     pub fn now(&self) -> Millis {
         self.now
+    }
+
+    /// `AT+CURCD` delay currently set (for tests).
+    pub fn curcd(&self) -> u16 {
+        self.settings.curcd
+    }
+
+    /// `AT+CVHU` currently set (for tests).
+    pub fn cvhu(&self) -> u8 {
+        self.settings.cvhu
     }
 
     /// The speaker gain currently set (for tests).
@@ -356,8 +397,13 @@ impl Sim {
         self.sched.push(Scheduled { at: self.now + after, seq: self.seq, effect });
     }
 
+    /// A URC chunk.
     fn emit(&mut self, bytes: Vec<u8>) {
-        self.rx.push_back((self.now, bytes));
+        self.emit_as(Origin::Urc, bytes);
+    }
+
+    fn emit_as(&mut self, origin: Origin, bytes: Vec<u8>) {
+        self.rx.push_back((self.now, origin, bytes));
     }
 
     fn shut_down(&mut self) {
@@ -372,7 +418,8 @@ impl Sim {
 
     fn apply(&mut self, effect: Effect) {
         match effect {
-            Effect::Emit(b) => self.emit(b),
+            Effect::Urc(b) => self.emit_as(Origin::Urc, b),
+            Effect::Reply(b) => self.emit_as(Origin::Reply, b),
             Effect::SimReady => self.sim_ready = true,
             Effect::Booted => {
                 self.power = Power::On;
@@ -429,18 +476,26 @@ impl Sim {
         let Some(mut c) = self.call.clone() else { return after };
         c.state = CallState::Disconnected;
         let mut t = after;
-        if c.bearer {
-            self.at(t, Effect::Emit(lines(&["+CGEV: NW DEACT 8,10"])));
+        let deact = |sim: &mut Sim, at| {
+            if c.bearer {
+                sim.at(at, Effect::Urc(lines(&["+CGEV: NW DEACT 8,10"])));
+            }
+        };
+        if self.cfg.bearer_down_first {
+            deact(self, t);
         }
         t += 95;
-        self.at(t, Effect::Emit(lines(&[&clcc_line(&c)])));
+        self.at(t, Effect::Urc(lines(&[&clcc_line(&c)])));
         self.at(t, Effect::CallGone);
+        if !self.cfg.bearer_down_first {
+            deact(self, t + 60);
+        }
         t += 250;
         let end = match c.active_since {
             Some(since) => format!("VOICE CALL: END: {}", hhmmss(self.now + t - since)),
             None => "VOICE CALL: END".to_string(),
         };
-        self.at(t, Effect::Emit(lines(&[&end, "NO CARRIER"])));
+        self.at(t, Effect::Urc(lines(&[&end, "NO CARRIER"])));
         t
     }
 
@@ -449,7 +504,7 @@ impl Sim {
         let Some(mut c) = self.call.clone() else { return };
         c.state = CallState::Disconnected;
         self.at(after, Effect::CallGone);
-        self.at(after, Effect::Emit(lines(&[&clcc_line(&c), "VOICE CALL: END", "NO CARRIER"])));
+        self.at(after, Effect::Urc(lines(&[&clcc_line(&c), "VOICE CALL: END", "NO CARRIER"])));
     }
 
     fn next_command(&mut self) {
@@ -466,23 +521,45 @@ impl Sim {
     /// when the final code goes out (the modem is busy until then).
     fn execute(&mut self, cmd: &str) -> Millis {
         let ok = |sim: &mut Sim, after: Millis| {
-            sim.at(after, Effect::Emit(lines(&["OK"])));
+            sim.at(after, Effect::Reply(lines(&["OK"])));
             after
         };
         let error = |sim: &mut Sim| {
-            sim.at(20, Effect::Emit(lines(&["ERROR"])));
+            sim.at(20, Effect::Reply(lines(&["ERROR"])));
             20
         };
         let reply = |sim: &mut Sim, after: Millis, info: &[&str]| {
             let mut all: Vec<&str> = info.to_vec();
             all.push("OK");
-            sim.at(after, Effect::Emit(lines(&all)));
+            sim.at(after, Effect::Reply(lines(&all)));
             after
         };
         let upper = cmd.to_ascii_uppercase();
+        // Several extended commands on one line (`AT+A=1;+B?`), as used by
+        // the resync probe (captured: one reply, one final).
+        if upper.starts_with("AT+") && upper.contains(';') {
+            let mut info = Vec::new();
+            for part in upper[2..].split(';') {
+                match self.extended(part) {
+                    Some(lines) => info.extend(lines),
+                    None => return error(self),
+                }
+            }
+            let refs: Vec<&str> = info.iter().map(String::as_str).collect();
+            return reply(self, 14, &refs);
+        }
         let set = |prefix: &str, max: u8| -> Option<u8> {
             upper.strip_prefix(prefix)?.parse().ok().filter(|&v| v <= max)
         };
+        if upper.starts_with("AT+CURCD") {
+            return match self.extended(&upper[2..]) {
+                Some(lines) => {
+                    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                    reply(self, 12, &refs)
+                }
+                None => error(self),
+            };
+        }
 
         match upper.as_str() {
             "AT" => return ok(self, 10),
@@ -533,9 +610,28 @@ impl Sim {
         error(self)
     }
 
+    /// One extended command from a combined line (`+CURCD=37,1`,
+    /// `+CURCD?`): its info lines, or `None` for an error. Only what the
+    /// stack combines is supported.
+    fn extended(&mut self, part: &str) -> Option<Vec<String>> {
+        match part {
+            "+CURCD?" => Some(vec![format!("+CURCD: {},1", self.settings.curcd)]),
+            "+CURCD=?" => Some(vec!["+CURCD: (0-10000),(1)".into()]),
+            _ => {
+                let args = part.strip_prefix("+CURCD=")?;
+                let (delay, cache) = args.split_once(',')?;
+                let delay: u16 = delay.parse().ok().filter(|&d| d <= 10_000)?;
+                (cache == "1").then(|| {
+                    self.settings.curcd = delay;
+                    Vec::new()
+                })
+            }
+        }
+    }
+
     fn dial(&mut self, number: &str) -> Millis {
         if self.call.is_some() || number.is_empty() {
-            self.at(20, Effect::Emit(lines(&["ERROR"])));
+            self.at(20, Effect::Reply(lines(&["ERROR"])));
             return 20;
         }
         self.call = Some(Call {
@@ -545,9 +641,9 @@ impl Sim {
             active_since: None,
             bearer: false,
         });
-        self.at(520, Effect::Emit(lines(&["OK"])));
+        self.at(520, Effect::Reply(lines(&["OK"])));
         if self.cfg.auto_network {
-            self.at(560, Effect::Bearer);
+            self.at(self.cfg.dial_bearer_ms, Effect::Bearer);
             self.at(2200, Effect::Dialling);
             self.at(3300, Effect::Alerting);
         }
@@ -556,14 +652,14 @@ impl Sim {
 
     fn answer(&mut self) -> Millis {
         if self.call.as_ref().map(|c| c.state) != Some(CallState::Incoming) {
-            self.at(20, Effect::Emit(lines(&["NO CARRIER"])));
+            self.at(20, Effect::Reply(lines(&["NO CARRIER"])));
             return 20;
         }
         if self.cfg.auto_network {
-            self.at(528, Effect::Bearer);
+            self.at(self.cfg.answer_bearer_ms, Effect::Bearer);
         }
         self.at(716, Effect::Connected);
-        self.at(727, Effect::Emit(lines(&["OK"])));
+        self.at(727, Effect::Reply(lines(&["OK"])));
         727
     }
 
@@ -576,7 +672,7 @@ impl Sim {
             }
             Some(_) => self.end_call(420) + 25,
         };
-        self.at(done, Effect::Emit(lines(&["OK"])));
+        self.at(done, Effect::Reply(lines(&["OK"])));
         done
     }
 }
@@ -772,6 +868,24 @@ mod tests {
         r.wait(3000); // +CPIN: READY
         r.send("AT+CLIP=1");
         assert_eq!(r.wait(200), ["AT+CLIP=1", "OK"]);
+    }
+
+    /// As checked on hardware (`curcd_probe`): works straight after boot,
+    /// write and read on one line give one reply and one `OK`.
+    #[test]
+    fn resync_probe_line() {
+        let mut sim = Sim::new(SimConfig::default());
+        sim.power_on(0);
+        sim.advance(6100); // *ATREADY out, SIM not ready
+        let mut r = Rig { sim, parser: AtParser::new() };
+        r.lines();
+        r.send("ATE0");
+        r.send("AT+CURCD=38,1;+CURCD?");
+        assert_eq!(r.wait(100), ["ATE0", "OK", "+CURCD: 38,1", "OK"]);
+        r.send("AT+CURCD?");
+        assert_eq!(r.wait(100), ["+CURCD: 38,1", "OK"]);
+        r.send("AT+CURCD=0,1;+CURCD?;+NOPE");
+        assert_eq!(r.wait(100), ["ERROR"]);
     }
 
     #[test]

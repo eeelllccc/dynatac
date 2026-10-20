@@ -25,6 +25,9 @@
 
 pub mod at;
 pub mod driver;
+/// Fault testing of L0 → L2 against the simulator: test builds only.
+#[cfg(test)]
+mod faults;
 pub mod hal;
 pub mod link;
 pub mod port;

@@ -9,7 +9,7 @@
 //!   - account for every received line as an echo, a reply line or a URC.
 
 use dynatac_core::modem::link::{
-    Command, Engine, Failure, Info, LinkEvent, Outcome, Output, ReplySpec, QUIET_MS,
+    probe_answer, Command, Engine, Failure, Info, LinkEvent, Outcome, Output, ReplySpec,
 };
 use dynatac_core::modem::request::{Gain, PhoneNumber, Request};
 use dynatac_core::modem::trace::{parse_trace, timeline, Direction, Step};
@@ -80,9 +80,10 @@ struct Replay {
 fn replay(text: &str) -> Replay {
     let records = parse_trace(text).unwrap();
     let mut e = Engine::new(is_urc, 0);
-    e.on_rx(Rx::Data(b"\r\nOK\r\n".to_vec()), 0);
-    e.on_tick(QUIET_MS);
-    while e.poll().is_some() {} // the probe and Synced
+    let Some(Output::Write(probe)) = e.poll() else { panic!("engine starts by probing") };
+    let answer = probe_answer(String::from_utf8_lossy(&probe).trim_end_matches('\r')).unwrap();
+    e.on_rx(Rx::Data(answer.into_bytes()), 0);
+    while e.poll().is_some() {} // Synced
 
     let mut r = Replay { writes: vec![], replies: vec![], urcs: vec![], events: vec![], log: vec![] };
     let mut sent: Vec<String> = Vec::new();

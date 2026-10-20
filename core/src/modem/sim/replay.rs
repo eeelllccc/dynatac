@@ -133,7 +133,7 @@ fn inputs(records: &[TraceRecord]) -> Vec<(Millis, Input)> {
 }
 
 fn run_sim(inputs: Vec<(Millis, Input)>, until: Millis) -> Vec<(Millis, String)> {
-    let mut sim = Sim::new(SimConfig { auto_network: false });
+    let mut sim = Sim::new(SimConfig { auto_network: false, ..SimConfig::default() });
     for (t, input) in inputs {
         match input {
             Input::Write(b) => sim.write(&b, t),

@@ -88,6 +88,9 @@ pub fn config_steps() -> Vec<(Request, Option<Response>)> {
     use Request as R;
     vec![
         (R::EchoOff, None),
+        // The resync probe leaves a small URC delay set: clear it first.
+        (R::ClearUrcDelay, None),
+        (R::QueryUrcDelay, Some(Response::Setting(0))),
         (R::SetVerboseErrors, None),
         (R::QueryVerboseErrors, Some(Response::Setting(2))),
         (R::SetVoiceHangUp, None),
@@ -348,7 +351,7 @@ mod on_sim;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modem::link::QUIET_MS;
+    use crate::modem::link::probe_answer;
     use crate::modem::request::PhoneNumber;
     use crate::modem::unsolicited::{CallState, Direction};
 
@@ -359,6 +362,7 @@ mod tests {
             "AT+CVHU?" => "\r\n+CVHU: 0\r\n\r\nOK\r\n",
             "AT+CLIP?" => "\r\n+CLIP: 1,1\r\n\r\nOK\r\n",
             "AT+COUTGAIN?" => "\r\n+COUTGAIN: 7\r\n\r\nOK\r\n",
+            "AT+CURCD?" => "\r\n+CURCD: 0,1\r\n\r\nOK\r\n",
             _ => "\r\nOK\r\n",
         }
     }
@@ -382,8 +386,7 @@ mod tests {
             let mut r = Rig::new();
             r.power_on();
             r.collect();
-            r.answer("\r\nOK\r\n"); // probe
-            r.advance(QUIET_MS);
+            r.answer_probe();
             r.configure_with(healthy);
             assert_eq!(r.events, [Event::Configured { issues: vec![] }]);
             r.events.clear();
@@ -427,6 +430,14 @@ mod tests {
             self.collect();
         }
 
+        /// Answer the latest resync probe written (earlier, unanswered
+        /// probes are superseded).
+        fn answer_probe(&mut self) {
+            let probe = self.writes.iter().rev().find(|w| w.starts_with("AT+CURCD=")).cloned().expect("a probe was written");
+            self.writes.clear();
+            self.rx(&probe_answer(&probe).unwrap());
+        }
+
         fn power_on(&mut self) {
             self.hal.power_on(self.now);
             self.collect();
@@ -452,9 +463,9 @@ mod tests {
     fn power_on_syncs_then_configures_in_order() {
         let mut r = Rig::new();
         r.power_on();
-        assert_eq!(r.writes, ["AT"]);
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        assert_eq!(r.writes.len(), 1);
+        assert!(r.writes[0].starts_with("AT+CURCD="), "{:?}", r.writes);
+        r.answer_probe();
         let mut sent = vec![];
         while !r.hal.is_ready() {
             let cmd = r.writes.front().cloned().unwrap();
@@ -464,7 +475,7 @@ mod tests {
         assert_eq!(
             sent,
             [
-                "ATE0", "AT+CMEE=2", "AT+CMEE?", "AT+CVHU=0", "AT+CVHU?", "AT+CLIP=1", "AT+CLIP?",
+                "ATE0", "AT+CURCD=0,1", "AT+CURCD?", "AT+CMEE=2", "AT+CMEE?", "AT+CVHU=0", "AT+CVHU?", "AT+CLIP=1", "AT+CLIP?",
                 "AT+COUTGAIN=7", "AT+COUTGAIN?"
             ]
         );
@@ -476,8 +487,7 @@ mod tests {
         let mut r = Rig::new();
         r.power_on();
         let id = r.submit(Request::ListCalls);
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         assert_eq!(r.writes, ["ATE0"]);
         r.configure_with(healthy);
         assert_eq!(r.writes, ["AT+CLCC"]);
@@ -496,8 +506,7 @@ mod tests {
         }
         let mut r = Rig::new();
         r.power_on();
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.configure_with(quiet_speaker);
         assert_eq!(
             r.events,
@@ -527,9 +536,22 @@ mod tests {
     #[test]
     fn modem_failure_codes_are_errors() {
         let mut r = Rig::ready();
+        let id = r.submit(Request::QueryOutputGain);
+        r.answer("\r\n+CME ERROR: operation not allowed\r\n");
+        assert_eq!(r.dones, [(id, Err(RequestError::Failed(Failure::Cme("operation not allowed".into()))))]);
+    }
+
+    /// A call-progress code during `ATD` (e.g. the previous call's late
+    /// `NO CARRIER`) is a URC; the dial still waits for its own `OK`.
+    #[test]
+    fn call_progress_codes_during_dial_are_urcs() {
+        let mut r = Rig::ready();
         let id = r.submit(Request::Dial(PhoneNumber::parse("07700900123").unwrap()));
-        r.answer("\r\nBUSY\r\n");
-        assert_eq!(r.dones, [(id, Err(RequestError::Failed(Failure::Code("BUSY".into()))))]);
+        r.rx("\r\nNO CARRIER\r\n\r\nBUSY\r\n");
+        assert!(r.dones.is_empty());
+        assert_eq!(r.events, [Event::Urc(Unsolicited::NoCarrier), Event::Urc(Unsolicited::Busy)]);
+        r.answer("\r\nOK\r\n");
+        assert_eq!(r.dones, [(id, Ok(Response::Done))]);
     }
 
     #[test]
@@ -548,11 +570,8 @@ mod tests {
         r.rx("\r\n*ATREADY: 1\r\n");
         assert_eq!(r.dones, [(a, Err(RequestError::Unknown(UnknownReason::Reset)))]);
         assert_eq!(r.events, [Event::Restarted]);
-        assert_eq!(r.writes.back().map(String::as_str), Some("AT")); // probing
-        r.writes.clear();
-        r.writes.push_back("AT".into());
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        assert!(r.writes.back().is_some_and(|w| w.starts_with("AT+CURCD="))); // probing
+        r.answer_probe();
         assert_eq!(r.writes.front().map(String::as_str), Some("ATE0"));
         r.configure_with(healthy);
         assert_eq!(r.writes, ["AT+COUTGAIN?"]);
@@ -568,10 +587,7 @@ mod tests {
         assert_eq!(r.dones, [(id, Err(RequestError::Unknown(UnknownReason::Timeout)))]);
         assert_eq!(r.events, [Event::LinkLost(UnsyncReason::Timeout)]);
         assert!(!r.hal.is_ready());
-        r.writes.clear();
-        r.writes.push_back("AT".into());
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.configure_with(healthy);
         assert_eq!(r.events.last(), Some(&Event::Configured { issues: vec![] }));
     }
@@ -580,16 +596,12 @@ mod tests {
     fn link_lost_during_configuration_restarts_it() {
         let mut r = Rig::new();
         r.power_on();
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.answer("\r\nOK\r\n"); // ATE0
         r.hal.on_rx(Rx::Lost, r.now); // during AT+CMEE=2
         r.collect();
         assert_eq!(r.events, [Event::BytesLost, Event::LinkLost(UnsyncReason::BytesLost)]);
-        r.writes.clear();
-        r.writes.push_back("AT".into());
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         assert_eq!(r.writes.front().map(String::as_str), Some("ATE0")); // from the top
     }
 
@@ -611,8 +623,7 @@ mod tests {
     fn caller_id_during_clip_query_stays_a_urc() {
         let mut r = Rig::new();
         r.power_on();
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.configure_with(|cmd| match cmd {
             "AT+CLIP?" => "\r\n+CLIP: \"07700900123\",129\r\n\r\n+CLIP: 1,1\r\n\r\nOK\r\n",
             c => healthy(c),
@@ -668,8 +679,7 @@ mod tests {
         }
         let mut r = Rig::new();
         r.power_on();
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.configure_with(sim_not_ready);
         assert_eq!(
             r.events,
@@ -699,8 +709,7 @@ mod tests {
         }
         let mut r = Rig::new();
         r.power_on();
-        r.answer("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.answer_probe();
         r.configure_with(sim_not_ready); // first pass: issues, retry armed
         r.events.clear();
         r.rx("\r\n+CPIN: READY\r\n"); // second pass starts

@@ -73,3 +73,7 @@ harness = false
 [[example]]
 name = "modem_hal_check"
 harness = false
+
+[[example]]
+name = "curcd_probe"
+harness = false

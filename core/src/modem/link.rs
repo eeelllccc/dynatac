@@ -14,11 +14,18 @@
 //!     ([`ReplySpec::extra_finals`]). Anything else that arrives meanwhile
 //!     is a URC — e.g. `NO CARRIER` during `AT+CHUP`, which the traces
 //!     show arriving *before* `CHUP`'s `OK`.
-//!   - The link is only *synced* once a probe `AT` got exactly one `OK`
-//!     and no further final code arrived within a quiet window. It starts
-//!     unsynced, and becomes unsynced on a timeout, lost bytes during a
-//!     command, a stray final code, or [`Engine::reset`]. Commands wait
-//!     while unsynced; URCs keep flowing.
+//!   - The link is only *synced* once the latest probe has been answered.
+//!     A probe writes a fresh number into a harmless setting and reads it
+//!     back in one command line: `AT+CURCD=<n>,1;+CURCD?` → `+CURCD: <n>,1`,
+//!     `OK` (the URC output delay, in ms; the HAL sets it back to 0). The
+//!     modem executes commands strictly in order, so once the read-back of
+//!     the latest `<n>` and its `OK` have arrived, every earlier command's
+//!     final has already arrived: nothing stale is left in flight. Finals
+//!     and read-backs before that are stale and ignored. (Checked on
+//!     hardware: works before the SIM is ready, combined line answered in
+//!     ~13 ms.) It starts unsynced, and becomes unsynced on a timeout, lost
+//!     bytes during a command, a stray final code, or [`Engine::reset`].
+//!     Commands wait while unsynced; URCs keep flowing.
 //!
 //! Invariants (callee):
 //!   - Every submitted command produces exactly one [`Output::Reply`].
@@ -36,10 +43,12 @@
 //!   - Call `on_tick` by [`Engine::next_deadline`] at the latest.
 //!   - Write every [`Output::Write`] in order, before feeding later input.
 //!
-//! Known limit: a final code arriving later than the quiet window after
-//! a resync would be credited to the next command. Command timeouts are
-//! set to the manual's maximum response time, so this needs the modem to
-//! break its own spec.
+//! The probe numbers cycle through 1..=[`PROBE_NONCES`]; a stale read-back
+//! could only be mistaken for the latest one if it were delayed by that
+//! many probe timeouts (~99 s) and then arrived exactly when its number
+//! came round again. Earlier designs counted finals within a quiet window;
+//! fault testing showed a delayed probe `OK` then shifted every later
+//! reply by one.
 
 use std::collections::VecDeque;
 
@@ -49,13 +58,27 @@ use super::transport::Rx;
 /// Milliseconds on the caller's monotonic clock.
 pub type Millis = u64;
 
-/// How long a probe `AT` may take before it is resent.
+/// How long a probe may take before a new one (with a new number) is sent.
 pub const PROBE_TIMEOUT_MS: Millis = 1000;
-/// After a probe's final code, how long to wait for a second (stale) one
-/// before trusting the link.
-pub const QUIET_MS: Millis = 300;
+/// Probe numbers cycle through `1..=PROBE_NONCES`. Each is also the URC
+/// delay (ms) while resyncing, so keep it small.
+pub const PROBE_NONCES: u16 = 99;
 
-const PROBE: &str = "AT";
+/// The probe command line for number `n`.
+pub fn probe_command(n: u16) -> String {
+    format!("AT+CURCD={n},1;+CURCD?")
+}
+
+/// The read-back line that answers the probe with number `n`.
+pub fn probe_readback(n: u16) -> String {
+    format!("+CURCD: {n},1")
+}
+
+/// The modem's full answer to `probe_command(n)`, for tests and simulators.
+pub fn probe_answer(written: &str) -> Option<String> {
+    let n: u16 = written.strip_prefix("AT+CURCD=")?.split(',').next()?.parse().ok()?;
+    Some(format!("\r\n{}\r\n\r\nOK\r\n", probe_readback(n)))
+}
 const CTRL_Z: u8 = 0x1A;
 const ESC: u8 = 0x1B;
 
@@ -187,13 +210,11 @@ struct InFlight {
 }
 
 struct Probe {
-    /// Resend if no final code by then.
+    nonce: u16,
+    /// Send a new probe if this one isn't answered by then.
     deadline: Millis,
-    finals: u32,
-    first_ok: bool,
-    /// Set by the first final code: trust the link if nothing else
-    /// arrives before this.
-    settle_until: Option<Millis>,
+    /// This probe's read-back has arrived; its `OK` comes next.
+    read_back: bool,
 }
 
 enum State {
@@ -210,6 +231,8 @@ pub struct Engine {
     out: VecDeque<Output>,
     next_id: u64,
     is_urc: fn(&str) -> bool,
+    /// Number of the last probe sent.
+    nonce: u16,
 }
 
 impl Engine {
@@ -231,6 +254,7 @@ impl Engine {
             out: VecDeque::new(),
             next_id: 0,
             is_urc,
+            nonce: 0,
         }
     }
 
@@ -272,20 +296,8 @@ impl Engine {
                 self.unsync(UnsyncReason::Timeout, Some(UnknownReason::Timeout), now);
             }
             State::Ready(_) => {}
-            State::Syncing(p) => match p.settle_until {
-                Some(t) if now >= t => {
-                    if p.finals == 1 && p.first_ok {
-                        self.state = State::Ready(None);
-                        self.out.push_back(Output::Event(LinkEvent::Synced));
-                        self.pump(now);
-                    } else {
-                        self.start_probe(now);
-                    }
-                }
-                Some(_) => {}
-                None if now >= p.deadline => self.start_probe(now),
-                None => {}
-            },
+            State::Syncing(p) if now >= p.deadline => self.start_probe(now),
+            State::Syncing(_) => {}
         }
     }
 
@@ -325,7 +337,7 @@ impl Engine {
         match &self.state {
             State::Off | State::Ready(None) => None,
             State::Ready(Some(f)) => Some(f.deadline),
-            State::Syncing(p) => Some(p.settle_until.unwrap_or(p.deadline)),
+            State::Syncing(p) => Some(p.deadline),
         }
     }
 
@@ -350,13 +362,9 @@ impl Engine {
     }
 
     fn start_probe(&mut self, now: Millis) {
-        self.write_command(PROBE);
-        self.state = State::Syncing(Probe {
-            deadline: now + PROBE_TIMEOUT_MS,
-            finals: 0,
-            first_ok: false,
-            settle_until: None,
-        });
+        self.nonce = self.nonce % PROBE_NONCES + 1;
+        self.write_command(&probe_command(self.nonce));
+        self.state = State::Syncing(Probe { nonce: self.nonce, deadline: now + PROBE_TIMEOUT_MS, read_back: false });
     }
 
     /// Lose sync: settle the in-flight command (if any) as `Unknown`, then
@@ -390,19 +398,28 @@ impl Engine {
         match &mut self.state {
             State::Off => self.out.push_back(Output::Urc(line)),
             State::Syncing(p) => {
-                if line == PROBE {
-                    return; // echo of the probe
+                if line == probe_command(p.nonce) {
+                    return; // echo of the probe (echo is on after a restart)
                 }
-                if standard_final(&line).is_none() {
-                    self.out.push_back(Output::Urc(line));
+                if line == probe_readback(p.nonce) {
+                    p.read_back = true;
                     return;
                 }
-                p.finals += 1;
-                if p.finals == 1 {
-                    p.first_ok = line == "OK";
-                    p.settle_until = Some(now + QUIET_MS);
+                if line.starts_with("+CURCD: ") {
+                    return; // an older probe's read-back: stale
+                }
+                let Some(outcome) = standard_final(&line) else {
+                    self.out.push_back(Output::Urc(line));
+                    return;
+                };
+                if !p.read_back {
+                    return; // a final from before this probe: stale
+                }
+                if outcome == Outcome::Ok {
+                    self.state = State::Ready(None);
+                    self.out.push_back(Output::Event(LinkEvent::Synced));
+                    self.pump(now);
                 } else {
-                    // Two finals for one probe: one was stale. Try again.
                     self.start_probe(now);
                 }
             }
@@ -499,13 +516,12 @@ mod tests {
     }
 
     impl Rig {
-        /// Synced at t = 0 … QUIET_MS, outputs drained.
+        /// Synced (probe 1 answered), outputs drained.
         fn synced() -> Self {
             let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
-            r.rx("\r\nOK\r\n");
-            r.advance(QUIET_MS);
+            r.rx(&answer(1));
             let out = r.take();
-            assert_eq!(out, [Output::Write(b"AT\r".to_vec()), Output::Event(LinkEvent::Synced)]);
+            assert_eq!(out, [probe(1), Output::Event(LinkEvent::Synced)]);
             r
         }
 
@@ -547,68 +563,105 @@ mod tests {
         Output::Event(e)
     }
 
+    /// The write of probe `n`.
+    fn probe(n: u16) -> Output {
+        write(&format!("{}\r", probe_command(n)))
+    }
+
+    /// The modem's answer to probe `n`.
+    fn answer(n: u16) -> String {
+        probe_answer(&probe_command(n)).unwrap()
+    }
+
     // --- sync ---------------------------------------------------------------
 
     #[test]
     fn starts_unsynced_and_probes() {
         let mut e = Engine::new(is_urc, 0);
         assert!(!e.is_synced());
-        assert_eq!(e.poll(), Some(write("AT\r")));
+        assert_eq!(e.poll(), Some(probe(1)));
         assert_eq!(e.next_deadline(), Some(PROBE_TIMEOUT_MS));
     }
 
     #[test]
-    fn probe_ok_then_quiet_window_syncs() {
+    fn probe_line_matches_the_hardware_check() {
+        assert_eq!(probe_command(38), "AT+CURCD=38,1;+CURCD?");
+        assert_eq!(probe_answer("AT+CURCD=38,1;+CURCD?").unwrap(), "\r\n+CURCD: 38,1\r\n\r\nOK\r\n");
+    }
+
+    #[test]
+    fn answered_probe_syncs_at_once() {
         let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
         r.take();
+        r.rx("\r\n+CURCD: 1,1\r\n");
+        assert!(!r.e.is_synced(), "not before its OK");
         r.rx("\r\nOK\r\n");
-        r.advance(QUIET_MS - 1);
-        assert!(!r.e.is_synced());
-        r.advance(1);
         assert!(r.e.is_synced());
         assert_eq!(r.take(), [ev(LinkEvent::Synced)]);
     }
 
     #[test]
-    fn unanswered_probe_is_resent() {
+    fn unanswered_probe_is_replaced_by_a_new_number() {
         let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
         r.take();
         r.advance(PROBE_TIMEOUT_MS);
-        assert_eq!(r.take(), [write("AT\r")]);
+        assert_eq!(r.take(), [probe(2)]);
+    }
+
+    #[test]
+    fn probe_numbers_cycle_within_range() {
+        let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
+        r.take();
+        for n in 2..=PROBE_NONCES {
+            r.advance(PROBE_TIMEOUT_MS);
+            assert_eq!(r.take(), [probe(n)]);
+        }
+        r.advance(PROBE_TIMEOUT_MS);
+        assert_eq!(r.take(), [probe(1)], "wraps to 1, never 0");
     }
 
     #[test]
     fn probe_echo_is_ignored() {
         let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
         r.take();
-        r.rx("AT\r\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.rx(&format!("{}\r{}", probe_command(1), answer(1)));
         assert_eq!(r.take(), [ev(LinkEvent::Synced)]);
     }
 
-    /// A stale final from a timed-out command lands in the probe window:
-    /// two finals for one probe, so nothing is trusted and it probes again.
+    /// Stale finals (from a timed-out command) before the read-back are
+    /// ignored, however many and whenever they arrive.
     #[test]
-    fn second_final_during_settling_restarts_the_probe() {
+    fn stale_finals_before_the_read_back_are_ignored() {
         let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
         r.take();
-        r.rx("\r\nOK\r\n");
-        r.advance(100);
-        r.rx("\r\nOK\r\n");
-        assert_eq!(r.take(), [write("AT\r")]);
-        r.rx("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.rx("\r\nOK\r\n\r\nERROR\r\n\r\nOK\r\n");
+        assert!(!r.e.is_synced());
+        assert_eq!(r.take(), []);
+        r.rx(&answer(1));
         assert_eq!(r.take(), [ev(LinkEvent::Synced)]);
+    }
+
+    /// A read-back from an earlier probe (answered late) doesn't count:
+    /// the latest probe's final would still be in flight.
+    #[test]
+    fn an_older_probes_read_back_is_ignored() {
+        let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
+        r.take();
+        r.advance(PROBE_TIMEOUT_MS); // probe 2 replaces probe 1
+        r.take();
+        r.rx(&answer(1)); // probe 1's late answer
+        assert!(!r.e.is_synced());
+        r.rx(&answer(2));
+        assert!(r.e.is_synced());
     }
 
     #[test]
     fn probe_error_does_not_sync() {
         let mut r = Rig { e: Engine::new(is_urc, 0), now: 0 };
         r.take();
-        r.rx("\r\nERROR\r\n");
-        r.advance(QUIET_MS);
+        r.rx("\r\n+CURCD: 1,1\r\n\r\nERROR\r\n");
         assert!(!r.e.is_synced());
-        assert_eq!(r.take(), [write("AT\r")]);
+        assert_eq!(r.take(), [probe(2)]);
     }
 
     #[test]
@@ -625,8 +678,7 @@ mod tests {
         r.take();
         r.submit(cmd("ATE0", NONE));
         assert_eq!(r.take(), []);
-        r.rx("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.rx(&answer(1));
         assert_eq!(r.take(), [ev(LinkEvent::Synced), write("ATE0\r")]);
     }
 
@@ -687,7 +739,7 @@ mod tests {
         assert_eq!(e.next_deadline(), None);
         e.reset(0);
         assert_eq!(e.poll(), Some(ev(LinkEvent::Unsynced(UnsyncReason::Reset))));
-        assert_eq!(e.poll(), Some(write("AT\r")));
+        assert_eq!(e.poll(), Some(probe(1)));
     }
 
     #[test]
@@ -804,17 +856,13 @@ mod tests {
             [
                 reply(id, Outcome::Unknown(UnknownReason::Timeout), &[]),
                 ev(LinkEvent::Unsynced(UnsyncReason::Timeout)),
-                write("AT\r"),
+                probe(2),
             ]
         );
-        // The late OK lands in the probe window, then the probe's own OK:
-        // two finals, so probe again rather than trust either.
+        // The late OK is stale (no read-back yet): ignored.
         r.rx("\r\nOK\r\n");
-        r.advance(10);
-        r.rx("\r\nOK\r\n");
-        assert_eq!(r.take(), [write("AT\r")]);
-        r.rx("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        assert_eq!(r.take(), []);
+        r.rx(&answer(2));
         assert_eq!(r.take(), [ev(LinkEvent::Synced)]);
     }
 
@@ -823,11 +871,9 @@ mod tests {
         let mut r = Rig::synced();
         let slow = r.submit(cmd("AT+COPS?", NONE));
         let next = r.submit(cmd("AT+CLCC", CLCC));
-        r.advance(5000); // slow times out
-        r.rx("\r\nOK\r\n"); // its late OK …
-        r.rx("\r\nOK\r\n"); // … and the probe's
-        r.rx("\r\nOK\r\n"); // second probe
-        r.advance(QUIET_MS);
+        r.advance(5000); // slow times out, probe 2 sent
+        r.rx("\r\nOK\r\n"); // its late OK: stale
+        r.rx(&answer(2)); // synced; CLCC sent
         r.rx("\r\nOK\r\n"); // CLCC's real reply
         let replies: Vec<_> = r.take().into_iter().filter(|o| matches!(o, Output::Reply(_))).collect();
         assert_eq!(
@@ -849,9 +895,27 @@ mod tests {
                 ev(LinkEvent::BytesLost),
                 reply(id, Outcome::Unknown(UnknownReason::BytesLost), &[]),
                 ev(LinkEvent::Unsynced(UnsyncReason::BytesLost)),
-                write("AT\r"),
+                probe(2),
             ]
         );
+    }
+
+    /// Found by fault testing (`faults::randomised_fault_schedules`): with
+    /// the old quiet-window resync, a stale `OK` followed by the probe's own
+    /// `OK` delayed past the window shifted every later reply by one. The
+    /// probe's read-back makes the delay irrelevant.
+    #[test]
+    fn probe_reply_delayed_past_the_quiet_window_is_not_misattributed() {
+        let mut r = Rig::synced();
+        r.submit(cmd("AT+CMEE=2", NONE));
+        r.lost(); // unsync, probe 2 sent
+        r.rx("\r\nOK\r\n"); // the CMEE=2's own OK: stale
+        r.advance(PROBE_TIMEOUT_MS - 1); // a long delay…
+        let q = r.submit(cmd("AT+COUTGAIN?", ReplySpec { info: Info::Prefixes(&["+COUTGAIN: "]), extra_finals: &[] }));
+        r.rx(&answer(2)); // …then the probe's answer
+        r.rx("\r\n+COUTGAIN: 7\r\n\r\nOK\r\n"); // the query's reply
+        let replies: Vec<_> = r.take().into_iter().filter(|o| matches!(o, Output::Reply(x) if x.id == q)).collect();
+        assert_eq!(replies, [reply(q, Outcome::Ok, &["+COUTGAIN: 7"])]);
     }
 
     #[test]
@@ -870,7 +934,7 @@ mod tests {
     fn stray_final_while_idle_resyncs() {
         let mut r = Rig::synced();
         r.rx("\r\nOK\r\n");
-        assert_eq!(r.take(), [ev(LinkEvent::Unsynced(UnsyncReason::StrayFinal)), write("AT\r")]);
+        assert_eq!(r.take(), [ev(LinkEvent::Unsynced(UnsyncReason::StrayFinal)), probe(2)]);
     }
 
     #[test]
@@ -885,11 +949,10 @@ mod tests {
             [
                 reply(a, Outcome::Unknown(UnknownReason::Reset), &[]),
                 ev(LinkEvent::Unsynced(UnsyncReason::Reset)),
-                write("AT\r"),
+                probe(2),
             ]
         );
-        r.rx("\r\nOK\r\n");
-        r.advance(QUIET_MS);
+        r.rx(&answer(2));
         assert_eq!(r.take(), [ev(LinkEvent::Synced), write("ATE0\r")]);
         r.rx("\r\nOK\r\n");
         assert_eq!(r.take(), [reply(b, Outcome::Ok, &[])]);
@@ -914,7 +977,7 @@ mod tests {
         );
         assert_eq!(r.e.next_deadline(), None);
         r.e.reset(r.now);
-        assert_eq!(r.take(), [ev(LinkEvent::Unsynced(UnsyncReason::Reset)), write("AT\r")]);
+        assert_eq!(r.take(), [ev(LinkEvent::Unsynced(UnsyncReason::Reset)), probe(2)]);
     }
 
     /// The captured ATD race: the bearer URC sometimes lands inside the
