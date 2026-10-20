@@ -48,7 +48,13 @@ pub struct Deliver {
     pub sent_at: Timestamp,
     pub body: Body,
     pub concat: Option<Concat>,
+    /// TP-PID. `0x40` ([`PID_TYPE_0`]) asks to be acknowledged and discarded.
+    pub pid: u8,
 }
+
+/// TP-PID of a "Short Message Type 0" (TS 23.040 §9.2.3.9): the receiver
+/// acknowledges it and must not store or show it ("silent SMS").
+pub const PID_TYPE_0: u8 = 0x40;
 
 /// A stored outgoing message (SMS-SUBMIT).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +97,24 @@ pub struct Timestamp {
 }
 
 /// One SMS-SUBMIT, for `AT+CMGS=<tpdu_len>` then `hex` at the prompt.
+/// Only [`encode_submit`] makes one, so the hex is always valid and holds
+/// nothing that ends the modem's input early (Ctrl-Z, ESC).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitPdu {
+    hex: String,
+    tpdu_len: usize,
+}
+
+impl SubmitPdu {
     /// The whole PDU, SMSC field (`00`: the SIM's default) included.
-    pub hex: String,
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+
     /// Octets after the SMSC field: the length `AT+CMGS` wants.
-    pub tpdu_len: usize,
+    pub fn tpdu_len(&self) -> usize {
+        self.tpdu_len
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,11 +192,11 @@ pub fn decode(hex: &str) -> Result<Pdu, PduError> {
     match first & 0x03 {
         0 => {
             let from = address(&mut r)?;
-            let _pid = r.u8()?;
+            let pid = r.u8()?;
             let dcs = r.u8()?;
             let sent_at = timestamp(r.take(7)?)?;
             let (body, concat) = user_data(&mut r, dcs, udhi)?;
-            Ok(Pdu::Deliver(Deliver { from, sent_at, body, concat }))
+            Ok(Pdu::Deliver(Deliver { from, sent_at, body, concat, pid }))
         }
         1 => {
             let _mr = r.u8()?;

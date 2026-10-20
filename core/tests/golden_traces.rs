@@ -9,6 +9,7 @@
 //! Fixture conventions: the dialled number is `07700900123`. Notes are
 //! capture-tool events (`pwrkey on-pulse end`, `ri low`, `mark: …`).
 
+use dynatac_core::modem::sms_inbox::Inbox;
 use dynatac_core::modem::sms_pdu::{self, Body, Concat, Pdu};
 use dynatac_core::modem::trace::{parse_trace, timeline, Step, TimedStep};
 
@@ -350,6 +351,16 @@ fn hang_up_ok_arrives_after_no_carrier() {
     }
 }
 
+/// The bearer-down URC races the call-ended `+CLCC`: before it in every
+/// earlier capture, after it in `15`. Nothing may depend on their order.
+#[test]
+fn hang_up_bearer_and_call_list_race() {
+    assert_eq!(
+        shapes(&reply(&load("15-sms-receive-in-call"), "AT+CHUP")),
+        ["+CLCC stat 6", "+CGEV: NW DEACT 8,10", "VOICE CALL: END: <duration>", "NO CARRIER", "OK"]
+    );
+}
+
 #[test]
 fn remote_hang_up_sequence() {
     for name in [
@@ -631,11 +642,14 @@ fn multipart_parts_can_be_stored_out_of_order() {
     for d in &parts {
         assert_eq!(d.concat, Some(Concat { reference, total: 3, seq: d.concat.unwrap().seq }));
     }
-    let mut ordered: Vec<_> = parts.iter().collect();
-    ordered.sort_by_key(|d| d.concat.unwrap().seq);
-    let joined: String = ordered.iter().map(|d| text(&d.body)).collect();
+    let mut inbox = Inbox::new();
+    for s in &listing[2..] {
+        inbox.add(&s.hex);
+    }
+    let [m] = &inbox.messages()[..] else { panic!("one text") };
+    assert!(m.complete);
     assert_eq!(
-        joined,
+        m.text,
         "The only way you could be sure is if the government has the money and you have a plan for the \
          next one and then the government can take it and make sure you get the right one for the right \
          price ✅✅✅"
@@ -669,12 +683,12 @@ fn send_prompts_then_reports_the_message_reference() {
     let mut sent = Vec::new();
     let mut refs = Vec::new();
     for pdu in [SHORT_TEXT, LONG_TEXT].iter().flat_map(|t| sms_pdu::encode_submit("07700900123", t, 1).unwrap()) {
-        let cmd = format!("AT+CMGS={}", pdu.tpdu_len);
+        let cmd = format!("AT+CMGS={}", pdu.tpdu_len());
         let r = reply(&steps, &cmd);
         let [prompt, payload, mr, ok] = &r[..] else { panic!("{cmd}: {r:?}") };
         assert_eq!((prompt.as_str(), payload.as_str(), ok.as_str()), ("> ", "<payload>", "OK"));
         refs.push(mr.strip_prefix("+CMGS: ").expect(mr).parse::<u8>().unwrap());
-        sent.push(format!("{}\x1A", pdu.hex));
+        sent.push(format!("{}\x1A", pdu.hex()));
     }
     let written: Vec<_> = steps
         .iter()

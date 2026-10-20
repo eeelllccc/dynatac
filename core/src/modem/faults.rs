@@ -479,9 +479,11 @@ impl Oracle {
                     Event::Configured { issues } => {
                         self.configured += 1;
                         self.allowed_gain.insert(7);
-                        // Only caller ID may fail (SIM not ready yet), unless
+                        // Only SIM-dependent settings may fail (caller ID before
+                        // the SIM is ready, SMS before `SMS DONE`), unless
                         // undetectable corruption is in play.
-                        if !link.corrupted && issues.iter().any(|i| !i.starts_with("AT+CLIP")) {
+                        let sim_dependent = ["AT+CLIP", "AT+CMGF", "AT+CNMI"];
+                        if !link.corrupted && issues.iter().any(|i| !sim_dependent.iter().any(|p| i.starts_with(p))) {
                             return Err(format!("unexpected config issues {issues:?}"));
                         }
                     }

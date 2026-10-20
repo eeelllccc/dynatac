@@ -36,7 +36,10 @@ pub mod port;
 pub mod power;
 pub mod request;
 pub mod service;
+pub mod sms_inbox;
 pub mod sms_pdu;
+pub mod sms_storage;
+pub mod sms_store;
 /// Byte-level A7682E simulator: test builds only.
 #[cfg(test)]
 pub(crate) mod sim;

@@ -4,13 +4,16 @@
 //!
 //! [`MockHal`] implements [`ModemPort`]. It starts configured. By default
 //! every request succeeds with a plausible response (from a small state:
-//! the call list and the speaker gain, both set by the test). Tests can:
+//! the call list, the speaker gain and the SIM's stored messages, all set
+//! by the test). Tests can:
 //!   - script the next matching request's result ([`MockHal::on`]),
 //!     including any failure (`Unknown`, `Failed`, `NotSent`, `Malformed`);
 //!   - hold replies ([`MockHal::hold`]) so events can be emitted before a
 //!     response, as the real modem does (`NO CARRIER` before `CHUP`'s `OK`),
 //!     then release them one by one;
 //!   - emit events and call-state changes;
+//!   - deliver an SMS ([`MockHal::receive_sms`]): stored in the lowest free
+//!     slot of a 10-slot SIM and announced with `+CMTI`, as the modem does;
 //!   - simulate a restart or link loss, which settles held replies as the
 //!     real HAL would.
 //!
@@ -25,6 +28,7 @@ use crate::modem::hal::{Event, RequestError, RequestId};
 use crate::modem::link::{UnknownReason, UnsyncReason};
 use crate::modem::port::{ModemPort, Notice};
 use crate::modem::request::{Gain, Request, Response};
+use crate::modem::sms_storage::{Status, Stored, Usage, SIM_SLOTS};
 use crate::modem::unsolicited::{CallInfo, CallMode, CallState, Direction, Unsolicited};
 
 type Matcher = Box<dyn Fn(&Request) -> bool>;
@@ -38,7 +42,11 @@ pub(crate) struct MockHal {
     held: VecDeque<(RequestId, Result<Response, RequestError>)>,
     calls: Vec<CallInfo>,
     gain: Gain,
+    /// The SIM's messages, by index.
+    messages: Vec<Stored>,
+    next_message_ref: u8,
 }
+
 
 impl MockHal {
     /// Configured, no calls, gain at maximum.
@@ -52,6 +60,8 @@ impl MockHal {
             held: VecDeque::new(),
             calls: Vec::new(),
             gain: Gain::MAX,
+            messages: Vec::new(),
+            next_message_ref: 0,
         }
     }
 
@@ -114,6 +124,29 @@ impl MockHal {
 
     pub fn set_gain(&mut self, gain: Gain) {
         self.gain = gain;
+    }
+
+    /// The SIM's messages, by index.
+    pub fn messages(&self) -> &[Stored] {
+        &self.messages
+    }
+
+    /// Replace the SIM's messages without announcing them (stored while
+    /// the device was off, or a `+CMTI` that was lost).
+    pub fn set_messages(&mut self, mut messages: Vec<Stored>) {
+        messages.sort_by_key(|m| m.index);
+        self.messages = messages;
+    }
+
+    /// An SMS arrives: stored unread in the lowest free slot, then
+    /// `+CMTI: "SM",<index>`. Returns the index, or `None` (nothing stored,
+    /// nothing announced) when the SIM is full.
+    pub fn receive_sms(&mut self, pdu: &str) -> Option<u32> {
+        let index = (1..=SIM_SLOTS).find(|i| self.messages.iter().all(|m| m.index != *i))?;
+        self.messages.push(Stored { index, status: Status::Unread, pdu: pdu.into() });
+        self.messages.sort_by_key(|m| m.index);
+        self.emit_urc(Unsolicited::NewSms { storage: "SM".into(), index });
+        Some(index)
     }
 
     /// The modem rebooted: held replies settle as `Unknown(Reset)`, then
@@ -187,26 +220,58 @@ impl MockHal {
         self.emit_urc(Unsolicited::NoCarrier);
     }
 
-    fn default_response(&self, r: &Request) -> Response {
+    /// The response, and its effect on the modem's state.
+    fn default_response(&mut self, r: &Request) -> Response {
         use Request as R;
         match r {
+            R::SetOutputGain(g) => {
+                self.gain = *g;
+                Response::Done
+            }
+            R::QueryStorage => {
+                let u = Usage { storage: "SM".into(), used: self.messages.len() as u32, total: SIM_SLOTS };
+                Response::Storage(vec![u.clone(), u.clone(), u])
+            }
+            R::ListMessages => {
+                let listed = self.messages.clone();
+                self.messages.iter_mut().filter(|m| m.status == Status::Unread).for_each(|m| m.status = Status::Read);
+                Response::Messages(listed)
+            }
+            R::ReadMessage(i) => {
+                let found = self.messages.iter_mut().find(|m| m.index == *i);
+                let listed = found.as_ref().map(|m| (*m).clone());
+                if let Some(m) = found.filter(|m| m.status == Status::Unread) {
+                    m.status = Status::Read;
+                }
+                Response::Messages(listed.into_iter().collect())
+            }
+            R::DeleteMessage(i) => {
+                self.messages.retain(|m| m.index != *i);
+                Response::Done
+            }
+            R::SendMessage(_) => {
+                self.next_message_ref = self.next_message_ref.wrapping_add(1);
+                Response::MessageRef(self.next_message_ref)
+            }
             R::ListCalls => Response::Calls(self.calls.clone()),
             R::QueryOutputGain => Response::Gain(self.gain),
             R::QueryVerboseErrors => Response::Setting(2),
             R::QueryVoiceHangUp => Response::Setting(0),
             R::QueryCallerId => Response::Setting(1),
             R::QueryUrcDelay => Response::Setting(0),
+            R::QueryPduMode => Response::Setting(0),
             R::Identify => Response::Lines(vec!["Model: A7682E".into()]),
             R::Firmware => Response::Firmware("A011B15A7682M7".into()),
             R::Dial(_)
             | R::Answer
             | R::HangUp
-            | R::SetOutputGain(_)
             | R::EchoOff
             | R::SetVerboseErrors
             | R::SetVoiceHangUp
             | R::SetCallerId
-            | R::ClearUrcDelay => Response::Done,
+            | R::ClearUrcDelay
+            | R::SetPduMode
+            | R::SetNewMessageIndication => Response::Done,
         }
     }
 }
@@ -223,12 +288,7 @@ impl ModemPort for MockHal {
         self.next_id += 1;
         let result = match self.scripted.iter().position(|(m, _)| m(&request)) {
             Some(i) => self.scripted.remove(i).1,
-            None => {
-                if let Request::SetOutputGain(g) = &request {
-                    self.gain = *g;
-                }
-                Ok(self.default_response(&request))
-            }
+            None => Ok(self.default_response(&request)),
         };
         self.sent.push(request);
         if self.holding {
@@ -373,6 +433,86 @@ mod tests {
         let id = f.submit(Request::QueryOutputGain);
         let n = drain(&mut f);
         assert_eq!(n[1], Notice::Done { id, result: Ok(Response::Gain(Gain::new(3).unwrap())) });
+    }
+
+    fn pdu(n: u8) -> String {
+        format!("00{n:02X}")
+    }
+
+    #[test]
+    fn sms_is_stored_in_the_lowest_free_slot_and_announced() {
+        let mut f = MockHal::new();
+        assert_eq!(f.receive_sms(&pdu(1)), Some(1));
+        assert_eq!(f.receive_sms(&pdu(2)), Some(2));
+        f.submit(Request::DeleteMessage(1));
+        assert_eq!(f.receive_sms(&pdu(3)), Some(1));
+        let n = drain(&mut f);
+        let announced: Vec<_> = n
+            .iter()
+            .filter_map(|n| match n {
+                Notice::Event(Event::Urc(Unsolicited::NewSms { storage, index })) => Some((storage.as_str(), *index)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, [("SM", 1), ("SM", 2), ("SM", 1)]);
+        let id = f.submit(Request::ListMessages);
+        let Some(Notice::Done { id: got, result: Ok(Response::Messages(m)) }) = f.poll() else { panic!() };
+        assert_eq!(got, id);
+        assert_eq!(m.iter().map(|m| (m.index, m.pdu.as_str())).collect::<Vec<_>>(), [(1, "0003"), (2, "0002")]);
+    }
+
+    #[test]
+    fn a_full_sim_stores_nothing() {
+        let mut f = MockHal::new();
+        for i in 0..SIM_SLOTS {
+            assert!(f.receive_sms(&pdu(i as u8)).is_some());
+        }
+        drain(&mut f);
+        assert_eq!(f.receive_sms(&pdu(99)), None);
+        assert_eq!(drain(&mut f), []);
+    }
+
+    /// Listing or reading marks unread messages read, as on the modem.
+    #[test]
+    fn listing_and_reading_mark_messages_read() {
+        let mut f = MockHal::new();
+        f.receive_sms(&pdu(1));
+        f.receive_sms(&pdu(2));
+        drain(&mut f);
+        let status = |f: &MockHal| f.messages().iter().map(|m| m.status).collect::<Vec<_>>();
+        f.submit(Request::ReadMessage(2));
+        assert_eq!(status(&f), [Status::Unread, Status::Read]);
+        f.submit(Request::ListMessages);
+        assert_eq!(status(&f), [Status::Read, Status::Read]);
+        let Some(Notice::Done { result: Ok(Response::Messages(m)), .. }) = drain(&mut f).pop() else { panic!() };
+        assert_eq!(m[0].status, Status::Unread, "listed as it was before the listing");
+        let id = f.submit(Request::ReadMessage(5));
+        assert_eq!(drain(&mut f), [Notice::Done { id, result: Ok(Response::Messages(vec![])) }]);
+        // Stored without an announcement.
+        f.set_messages(vec![Stored { index: 4, status: Status::Unread, pdu: pdu(4) }]);
+        assert_eq!(drain(&mut f), []);
+        assert_eq!(f.messages()[0].index, 4);
+    }
+
+    #[test]
+    fn storage_and_send() {
+        let mut f = MockHal::new();
+        f.receive_sms(&pdu(1));
+        drain(&mut f);
+        f.submit(Request::QueryStorage);
+        let Some(Notice::Done { result: Ok(Response::Storage(u)), .. }) = f.poll() else { panic!() };
+        assert_eq!((u[2].used, u[2].total), (1, SIM_SLOTS));
+        let p = crate::modem::sms_pdu::encode_submit("07700900123", "hi", 0).unwrap().remove(0);
+        f.submit(Request::SendMessage(p.clone()));
+        f.submit(Request::SendMessage(p));
+        let refs: Vec<_> = drain(&mut f)
+            .into_iter()
+            .map(|n| match n {
+                Notice::Done { result: Ok(Response::MessageRef(r)), .. } => r,
+                n => panic!("{n:?}"),
+            })
+            .collect();
+        assert_eq!(refs, [1, 2]);
     }
 
     /// A call change whose URC was lost: only a query reveals it.

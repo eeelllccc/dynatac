@@ -39,6 +39,15 @@ fn textbook_deliver() {
     );
     assert_eq!(d.body, Body::Text("hellohello".into()));
     assert_eq!(d.concat, None);
+    assert_eq!(d.pid, 0);
+}
+
+/// Hand-built: the textbook DELIVER with TP-PID 0x40 (Type 0), as seen
+/// from real senders in capture 13.
+#[test]
+fn type_0_is_reported_by_its_pid() {
+    let d = deliver("07917283010010F5040BC87238880900F14000993092516195800AE8329BFD4697D9EC37");
+    assert_eq!(d.pid, PID_TYPE_0);
 }
 
 /// The matching published SMS-SUBMIT example (to +46708251358, VP 4 days):

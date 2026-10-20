@@ -21,6 +21,13 @@
 //!     (silence), `AT+CLCC=1` → `ERROR`, `AT+CURCD` write / read-back and
 //!     the combined probe line `AT+CURCD=<n>,1;+CURCD?` (from the
 //!     `curcd_probe` hardware check, incl. before the SIM is ready).
+//!     SMS (captures 13–16): a 10-slot SIM store that survives restarts;
+//!     text mode (`+CMGF: 1`) after every boot; `+CNMI` saved; a new
+//!     message stored in the lowest free slot and announced with
+//!     `+CMTI: "SM",<index>`, idle or in a call; the `+CMGL` / `+CMGR`
+//!     formats, listing and reading marking messages read; `AT+CMGD`;
+//!     `AT+CMGS=<n>` → `\r\n> \r\n` prompt, then the PDU up to Ctrl-Z, then
+//!     `+CMGS: <mr>` (counting up per message) ~1.2 s later and `OK`.
 //!   - From the manual, not captured: `NO_SAVE` settings (`ATE`, `CMEE`,
 //!     `CVHU`) reset on boot while `AUTO_SAVE` ones (`CLIP`, `COUTGAIN`)
 //!     persist; `ATH` ignored for voice unless `AT+CVHU=0`; `ATA` with no
@@ -31,6 +38,16 @@
 //!     the modem ignores input until `*ATREADY`; ESC and Ctrl-Z outside
 //!     SMS input are ignored; unknown commands →
 //!     `ERROR`; `ATD` with a call already present → `ERROR`.
+//!     SMS: commands fail with `+CMS ERROR: SIM busy` until `SMS DONE`;
+//!     an empty or out-of-range slot read → `+CMS ERROR: invalid memory
+//!     index` (TS 27.005); deleting an empty slot → `OK`; a PDU whose
+//!     length doesn't match `AT+CMGS` → `+CMS ERROR: invalid PDU mode
+//!     parameter`; ESC in SMS input cancels with `OK`; a message arriving
+//!     at a full SIM is not stored or announced; in text mode `+CMGL` /
+//!     `+CMGR` fail with `+CMS ERROR: operation not allowed` (simplified),
+//!     while `AT+CMGS=<n>` sends the input as a *text* to the number `<n>`
+//!     (TS 27.005 text mode; recorded as [`SentSms::Text`] so tests can
+//!     check it never happens).
 //!
 //! The network and the far end are inputs, not modelled behaviour: dial
 //! progress, the voice bearer, and the remote side answering, hanging up,
@@ -38,12 +55,13 @@
 //! side of an outgoing call progresses on its own (as typically
 //! captured); the far end only ever acts when a test says so.
 //!
-//! Not yet modelled: SMS, the RI pin, data mode, fault injection (step 5
-//! of `todo.md`).
+//! Not yet modelled: the RI pin, data mode, echo of SMS input, status
+//! reports, storages other than the SIM.
 
 use std::collections::VecDeque;
 
 use super::link::Millis;
+use super::sms_storage::Status;
 use super::transport::{Clock, Rx, Transport, WriteError};
 use super::unsolicited::{CallState, Direction};
 
@@ -59,6 +77,11 @@ const BOOT: &[(Millis, &str)] = &[
 const DETACH_AFTER: Millis = 390;
 const ECHO_AFTER: Millis = 10;
 const RING_PERIOD: Millis = 6000;
+use super::sms_storage::SIM_SLOTS as SMS_SLOTS;
+/// `AT+CMGS` input done → `+CMGS: <mr>` (captured 1.08–1.33 s).
+const SMS_SEND_MS: Millis = 1240;
+const CTRL_Z: u8 = 0x1A;
+const ESC: u8 = 0x1B;
 
 /// Captured `ATI` reply (IMEI scrubbed, as in the fixtures).
 const ATI: &[&str] = &[
@@ -118,13 +141,17 @@ struct Settings {
     /// `AT+CURCD` URC delay (ms). Stored and read back; the delay itself
     /// is not modelled.
     curcd: u16,
+    /// `AT+CMGF`: 0 = PDU, 1 = text. `NO_SAVE` (captured: 1 after boot).
+    cmgf: u8,
+    /// `AT+CNMI=2,<mt>,0,0,0`: `+CMTI` when 1. Saved (captured 1 at boot).
+    cnmi_mt: u8,
 }
 
 impl Settings {
     /// Defaults of the `NO_SAVE` settings after boot; `AUTO_SAVE` ones
     /// (`clip`, `gain`) keep their stored values.
     fn after_boot(self) -> Self {
-        Settings { echo: true, cmee: 0, cvhu: 1, curcd: 0, ..self }
+        Settings { echo: true, cmee: 0, cvhu: 1, curcd: 0, cmgf: 1, ..self }
     }
 }
 
@@ -137,12 +164,40 @@ struct Call {
     bearer: bool,
 }
 
+/// A message on the SIM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimSms {
+    pub index: u32,
+    pub status: Status,
+    /// PDU hex, SMSC address first.
+    pub pdu: String,
+}
+
+/// What the modem sent to the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SentSms {
+    /// In PDU mode: this PDU (hex, as written).
+    Pdu(String),
+    /// In text mode: the input as text, to the "number" `AT+CMGS` named.
+    Text { to: String, body: String },
+}
+
+/// Collecting `AT+CMGS` input up to Ctrl-Z.
+#[derive(Debug)]
+struct SmsInput {
+    /// `AT+CMGS=<arg>`: the TPDU length (PDU mode) or number (text mode).
+    arg: String,
+    pdu_mode: bool,
+    buf: Vec<u8>,
+}
+
 #[derive(Debug)]
 enum Effect {
     Urc(Vec<u8>),
     Reply(Vec<u8>),
     Booted,
     SimReady,
+    SmsReady,
     /// The modem finished the current command and takes the next.
     Finish,
     Dialling,
@@ -176,6 +231,15 @@ pub struct Sim {
     call: Option<Call>,
     /// `+CPIN: READY` has been sent this boot.
     sim_ready: bool,
+    /// `SMS DONE` has been sent this boot.
+    sms_ready: bool,
+    /// The SIM's messages, by index. Survive restarts.
+    messages: Vec<SimSms>,
+    /// `AT+CMGS` waiting for its input.
+    input: Option<SmsInput>,
+    /// The next `+CMGS: <mr>`.
+    next_mr: u8,
+    sent: Vec<SentSms>,
 }
 
 fn lines(ls: &[&str]) -> Vec<u8> {
@@ -193,7 +257,7 @@ impl Sim {
         Sim {
             cfg,
             power: Power::Off,
-            settings: Settings { echo: true, cmee: 0, cvhu: 1, clip: 0, gain: 4, curcd: 0 },
+            settings: Settings { echo: true, cmee: 0, cvhu: 1, clip: 0, gain: 4, curcd: 0, cmgf: 1, cnmi_mt: 1 },
             line: Vec::new(),
             commands: VecDeque::new(),
             busy: false,
@@ -203,6 +267,11 @@ impl Sim {
             rx: VecDeque::new(),
             call: None,
             sim_ready: false,
+            sms_ready: false,
+            messages: Vec::new(),
+            input: None,
+            next_mr: 0,
+            sent: Vec::new(),
         }
     }
 
@@ -221,6 +290,9 @@ impl Sim {
             }
             if line == "+CPIN: READY" {
                 self.at(after, Effect::SimReady);
+            }
+            if line == "SMS DONE" {
+                self.at(after, Effect::SmsReady);
             }
             self.at(after, Effect::Urc(lines(&[line])));
         }
@@ -304,6 +376,46 @@ impl Sim {
         self.at(40, Effect::Urc(lines(&[&clcc])));
     }
 
+    /// An SMS arrives from the network: stored unread in the lowest free
+    /// slot and announced (if `+CNMI` says so). Returns the slot; `None`
+    /// if the modem is off, not ready for SMS, or the SIM is full.
+    pub fn receive_sms(&mut self, pdu: &str, now: Millis) -> Option<u32> {
+        self.advance(now);
+        if self.power != Power::On || !self.sms_ready {
+            return None;
+        }
+        let index = (1..=SMS_SLOTS).find(|i| self.messages.iter().all(|m| m.index != *i))?;
+        self.store_sms(SimSms { index, status: Status::Unread, pdu: pdu.into() });
+        if self.settings.cnmi_mt == 1 {
+            self.emit(lines(&[&format!("+CMTI: \"SM\",{index}")]));
+        }
+        Some(index)
+    }
+
+    /// Put a message on the SIM silently (e.g. stored before the test),
+    /// replacing any in its slot.
+    pub fn store_sms(&mut self, sms: SimSms) {
+        self.messages.retain(|m| m.index != sms.index);
+        self.messages.push(sms);
+        self.messages.sort_by_key(|m| m.index);
+    }
+
+    /// The SIM's messages, by index.
+    pub fn messages(&self) -> &[SimSms] {
+        &self.messages
+    }
+
+    /// Everything sent to the network, in order.
+    pub fn sent_sms(&self) -> &[SentSms] {
+        &self.sent
+    }
+
+    /// The reference the next sent message gets (a counter on the real
+    /// modem; for replaying captures).
+    pub fn set_next_message_reference(&mut self, mr: u8) {
+        self.next_mr = mr;
+    }
+
     // --- UART -------------------------------------------------------------
 
     /// Bytes written to the modem at `now`.
@@ -313,6 +425,10 @@ impl Sim {
             return; // UART not up yet / unpowered
         }
         for &b in bytes {
+            if self.input.is_some() {
+                self.sms_input(b);
+                continue;
+            }
             if b == b'\r' {
                 let cmd = String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned();
                 if cmd.is_empty() {
@@ -414,6 +530,8 @@ impl Sim {
         self.busy = false;
         self.call = None;
         self.sim_ready = false;
+        self.sms_ready = false;
+        self.input = None;
     }
 
     fn apply(&mut self, effect: Effect) {
@@ -421,6 +539,7 @@ impl Sim {
             Effect::Urc(b) => self.emit_as(Origin::Urc, b),
             Effect::Reply(b) => self.emit_as(Origin::Reply, b),
             Effect::SimReady => self.sim_ready = true,
+            Effect::SmsReady => self.sms_ready = true,
             Effect::Booted => {
                 self.power = Power::On;
                 self.settings = self.settings.after_boot();
@@ -514,7 +633,10 @@ impl Sim {
         let Some(cmd) = self.commands.pop_front() else { return };
         self.busy = true;
         let done = self.execute(&cmd);
-        self.at(done, Effect::Finish);
+        // `AT+CMGS` finishes when its input does.
+        if self.input.is_none() {
+            self.at(done, Effect::Finish);
+        }
     }
 
     /// Carry out one command: schedule its output and effects. Returns
@@ -607,7 +729,159 @@ impl Sim {
         if let Some(number) = upper.strip_prefix("ATD").and_then(|n| n.strip_suffix(';')) {
             return self.dial(&cmd[3..3 + number.len()]);
         }
+        if upper.starts_with("AT+CMG") || upper.starts_with("AT+CNMI") || upper.starts_with("AT+CPMS") {
+            return self.sms_command(&upper);
+        }
         error(self)
+    }
+
+    /// `+CMS ERROR` in the form `AT+CMEE` asks for.
+    fn cms_error(&mut self, code: u16, text: &str) -> Millis {
+        let line = match self.settings.cmee {
+            0 => "ERROR".to_string(),
+            1 => format!("+CMS ERROR: {code}"),
+            _ => format!("+CMS ERROR: {text}"),
+        };
+        self.at(20, Effect::Reply(lines(&[&line])));
+        20
+    }
+
+    fn sms_command(&mut self, upper: &str) -> Millis {
+        let reply = |sim: &mut Sim, after: Millis, info: &[String]| {
+            let mut all: Vec<&str> = info.iter().map(String::as_str).collect();
+            all.push("OK");
+            sim.at(after, Effect::Reply(lines(&all)));
+            after
+        };
+        if !self.sms_ready {
+            return self.cms_error(314, "SIM busy");
+        }
+        let arg = |prefix: &str| upper.strip_prefix(prefix);
+        let pdu_mode = self.settings.cmgf == 0;
+        match upper {
+            "AT+CMGF?" => return reply(self, 12, &[format!("+CMGF: {}", self.settings.cmgf)]),
+            "AT+CMGF=0" | "AT+CMGF=1" => {
+                self.settings.cmgf = (upper == "AT+CMGF=1") as u8;
+                return reply(self, 100, &[]);
+            }
+            "AT+CNMI?" => return reply(self, 14, &[format!("+CNMI: 2,{},0,0,0", self.settings.cnmi_mt)]),
+            "AT+CNMI=2,0,0,0,0" | "AT+CNMI=2,1,0,0,0" => {
+                self.settings.cnmi_mt = (upper == "AT+CNMI=2,1,0,0,0") as u8;
+                return reply(self, 15, &[]);
+            }
+            "AT+CPMS?" => {
+                let u = format!("\"SM\",{},{SMS_SLOTS}", self.messages.len());
+                return reply(self, 14, &[format!("+CPMS: {u},{u},{u}")]);
+            }
+            _ => {}
+        }
+        if let Some(stat) = arg("AT+CMGL=") {
+            if !pdu_mode {
+                return self.cms_error(302, "operation not allowed");
+            }
+            let wanted: Option<Status> = match stat {
+                "0" => Some(Status::Unread),
+                "1" => Some(Status::Read),
+                "2" => Some(Status::Unsent),
+                "3" => Some(Status::Sent),
+                "4" => None,
+                _ => return self.cms_error(302, "operation not allowed"),
+            };
+            let mut info = Vec::new();
+            for m in self.messages.iter_mut().filter(|m| wanted.is_none_or(|w| m.status == w)) {
+                info.push(format!("+CMGL: {},{},,{}", m.index, stat_code(m.status), tpdu_len(&m.pdu)));
+                info.push(m.pdu.clone());
+                if m.status == Status::Unread {
+                    m.status = Status::Read;
+                }
+            }
+            let after = 15 + 5 * info.len() as Millis;
+            return reply(self, after, &info);
+        }
+        if let Some(i) = arg("AT+CMGR=").and_then(|i| i.parse::<u32>().ok()) {
+            if !pdu_mode {
+                return self.cms_error(302, "operation not allowed");
+            }
+            let Some(m) = self.messages.iter_mut().find(|m| m.index == i) else {
+                return self.cms_error(321, "invalid memory index");
+            };
+            let info = [format!("+CMGR: {},\"\",{}", stat_code(m.status), tpdu_len(&m.pdu)), m.pdu.clone()];
+            if m.status == Status::Unread {
+                m.status = Status::Read;
+            }
+            return reply(self, 33, &info);
+        }
+        if let Some(args) = arg("AT+CMGD=") {
+            let (index, flag) = args.split_once(',').unwrap_or((args, "0"));
+            let (Ok(index), Ok(flag)) = (index.parse::<u32>(), flag.parse::<u8>()) else {
+                return self.cms_error(302, "operation not allowed");
+            };
+            if !(1..=SMS_SLOTS).contains(&index) || flag > 4 {
+                return self.cms_error(321, "invalid memory index");
+            }
+            return match flag {
+                0 => {
+                    self.messages.retain(|m| m.index != index);
+                    reply(self, 59, &[])
+                }
+                4 => {
+                    self.messages.clear();
+                    reply(self, 310, &[])
+                }
+                _ => self.cms_error(302, "operation not allowed"), // other flags: not used
+            };
+        }
+        if let Some(a) = arg("AT+CMGS=") {
+            let valid = if pdu_mode {
+                a.parse::<usize>().is_ok_and(|n| (7..=164).contains(&n))
+            } else {
+                !a.is_empty()
+            };
+            if !valid {
+                return self.cms_error(304, "invalid PDU mode parameter");
+            }
+            self.input = Some(SmsInput { arg: a.to_string(), pdu_mode, buf: Vec::new() });
+            self.at(22, Effect::Reply(b"\r\n> \r\n".to_vec()));
+            return 22;
+        }
+        self.cms_error(302, "operation not allowed")
+    }
+
+    /// One byte of `AT+CMGS` input.
+    fn sms_input(&mut self, b: u8) {
+        let done = match b {
+            ESC => {
+                self.input = None;
+                self.at(15, Effect::Reply(lines(&["OK"])));
+                15
+            }
+            CTRL_Z => {
+                let input = self.input.take().expect("in SMS input");
+                let body = String::from_utf8_lossy(&input.buf).into_owned();
+                if input.pdu_mode {
+                    let ok = sms_pdu_ok(&body) && input.arg.parse() == Ok(tpdu_len(&body));
+                    if !ok {
+                        self.cms_error(304, "invalid PDU mode parameter");
+                        self.at(20, Effect::Finish);
+                        return;
+                    }
+                    self.sent.push(SentSms::Pdu(body));
+                } else {
+                    self.sent.push(SentSms::Text { to: input.arg, body });
+                }
+                let mr = self.next_mr;
+                self.next_mr = mr.wrapping_add(1);
+                self.at(SMS_SEND_MS, Effect::Reply(lines(&[&format!("+CMGS: {mr}")])));
+                self.at(SMS_SEND_MS + 10, Effect::Reply(lines(&["OK"])));
+                SMS_SEND_MS + 10
+            }
+            b'\r' | b'\n' => return,
+            _ => {
+                self.input.as_mut().expect("in SMS input").buf.push(b);
+                return;
+            }
+        };
+        self.at(done, Effect::Finish);
     }
 
     /// One extended command from a combined line (`+CURCD=37,1`,
@@ -675,6 +949,26 @@ impl Sim {
         self.at(done, Effect::Reply(lines(&["OK"])));
         done
     }
+}
+
+fn stat_code(s: Status) -> u8 {
+    match s {
+        Status::Unread => 0,
+        Status::Read => 1,
+        Status::Unsent => 2,
+        Status::Sent => 3,
+    }
+}
+
+/// Whether `pdu` is hex with a plausible SMSC field.
+fn sms_pdu_ok(pdu: &str) -> bool {
+    super::sms_pdu::is_hex_line(pdu) && pdu.len() >= 4
+}
+
+/// The PDU's octets after its SMSC address (what `+CMGL` / `AT+CMGS` count).
+fn tpdu_len(pdu: &str) -> usize {
+    let sca = pdu.get(..2).and_then(|h| usize::from_str_radix(h, 16).ok()).unwrap_or(0);
+    (pdu.len() / 2).saturating_sub(1 + sca)
 }
 
 fn number_type(n: &str) -> u8 {

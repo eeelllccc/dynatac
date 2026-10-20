@@ -58,6 +58,13 @@ pub trait Clock {
     fn now(&self) -> u64;
 }
 
+/// The L0 queue capacity the stack is designed for. A reply only gets
+/// through if it fits whole (the modem sends it in one burst, faster than
+/// it may be consumed), and the largest is a listing of a full SIM:
+/// [`super::sms_storage::MAX_LIST_REPLY_BYTES`], ~3.7 KB. Twice that leaves
+/// room for URCs and a slow consumer.
+pub const RX_QUEUE_BYTES: usize = 8 * 1024;
+
 /// Bounded FIFO of received bytes with loss markers.
 ///
 /// Holds at most `capacity` bytes. Bytes pushed when it is full are dropped

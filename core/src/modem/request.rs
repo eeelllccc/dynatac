@@ -22,8 +22,17 @@
 //! ended the `ATD` early and every later reply was credited one command
 //! late. Mistaking a final for a URC only costs a timeout (`Unknown`);
 //! the reverse corrupts replies.
+//!
+//! SMS requests assume PDU mode (`AT+CMGF=0`, lost at every restart), so
+//! message bodies are single hex lines. Their timeouts are not from the
+//! manual: storage commands answer in < 0.5 s in every capture (deleting
+//! all of a full SIM: 0.3 s), so the 9 s default; `AT+CMGS` waits for the
+//! network (0.9–1.4 s captured), so 60 s. The link carries one command at a
+//! time, so a longer send timeout would hold up everything else.
 
 use super::link::{Command, Info, Millis, ReplySpec};
+use super::sms_pdu::SubmitPdu;
+use super::sms_storage::{self, Stored, Usage};
 use super::unsolicited::{parse_call, CallInfo};
 
 /// A dialable number: an optional leading `+`, then 1–40 of `0-9 * #`.
@@ -91,6 +100,23 @@ pub enum Request {
     Identify,
     /// `AT+CGMR`.
     Firmware,
+    /// `AT+CMGF=0`: PDU mode. Not saved: needed after every restart.
+    SetPduMode,
+    /// `AT+CMGF?` → `+CMGF: <mode>` (0 = PDU).
+    QueryPduMode,
+    /// `AT+CNMI=2,1,0,0,0`: announce each stored message with `+CMTI`.
+    SetNewMessageIndication,
+    /// `AT+CPMS?`: which storage is used, and how full it is.
+    QueryStorage,
+    /// `AT+CMGL=4`: every stored message. Marks unread messages read.
+    ListMessages,
+    /// `AT+CMGR=<index>`: one stored message. Marks it read.
+    ReadMessage(u32),
+    /// `AT+CMGD=<index>`: delete one message; the others keep their indices.
+    DeleteMessage(u32),
+    /// `AT+CMGS=<length>`, then the PDU at the `> ` prompt: send one SMS
+    /// (one part of a long text). Replies with the message reference.
+    SendMessage(SubmitPdu),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,10 +129,18 @@ pub enum Response {
     Setting(u8),
     Lines(Vec<String>),
     Firmware(String),
+    /// `ListMessages`, in the modem's order; `ReadMessage`: none (empty
+    /// slot) or one.
+    Messages(Vec<Stored>),
+    /// Read/delete, write/send and receive storage.
+    Storage(Vec<Usage>),
+    /// The network's reference for a sent message (`+CMGS: <mr>`).
+    MessageRef(u8),
 }
 
 const T_DEFAULT: Millis = 9_000;
 const T_CALL: Millis = 10_000;
+const T_SEND_SMS: Millis = 60_000;
 
 fn setting_line(prefix: &'static str) -> impl Fn(&str) -> Option<u8> {
     move |l: &str| l.strip_prefix(prefix)?.split(',').next()?.trim().parse().ok()
@@ -129,6 +163,7 @@ impl Request {
         use Request as R;
         let none = ReplySpec { info: Info::None, extra_finals: &[] };
         let prefixed = |p: &'static [&'static str]| ReplySpec { info: Info::Prefixes(p), extra_finals: &[] };
+        let matching = |f: fn(&str) -> bool| ReplySpec { info: Info::Matching(f), extra_finals: &[] };
         let (text, spec, timeout_ms) = match self {
             R::Dial(n) => (format!("ATD{};", n.as_str()), none, T_CALL),
             R::Answer => ("ATA".into(), none, T_CALL),
@@ -142,15 +177,23 @@ impl Request {
             R::SetVoiceHangUp => ("AT+CVHU=0".into(), none, T_DEFAULT),
             R::QueryVoiceHangUp => ("AT+CVHU?".into(), prefixed(&["+CVHU: "]), T_DEFAULT),
             R::SetCallerId => ("AT+CLIP=1".into(), none, T_DEFAULT),
-            R::QueryCallerId => (
-                "AT+CLIP?".into(),
-                ReplySpec { info: Info::Matching(is_clip_setting), extra_finals: &[] },
-                T_DEFAULT,
-            ),
+            R::QueryCallerId => ("AT+CLIP?".into(), matching(is_clip_setting), T_DEFAULT),
             R::ClearUrcDelay => ("AT+CURCD=0,1".into(), none, T_DEFAULT),
             R::QueryUrcDelay => ("AT+CURCD?".into(), prefixed(&["+CURCD: "]), T_DEFAULT),
-            R::Identify => ("ATI".into(), ReplySpec { info: Info::Matching(is_ati_line), extra_finals: &[] }, T_DEFAULT),
+            R::Identify => ("ATI".into(), matching(is_ati_line), T_DEFAULT),
             R::Firmware => ("AT+CGMR".into(), prefixed(&["+CGMR: "]), T_DEFAULT),
+            R::SetPduMode => ("AT+CMGF=0".into(), none, T_DEFAULT),
+            R::QueryPduMode => ("AT+CMGF?".into(), prefixed(&["+CMGF: "]), T_DEFAULT),
+            R::SetNewMessageIndication => ("AT+CNMI=2,1,0,0,0".into(), none, T_DEFAULT),
+            R::QueryStorage => ("AT+CPMS?".into(), prefixed(&["+CPMS: "]), T_DEFAULT),
+            R::ListMessages => ("AT+CMGL=4".into(), matching(sms_storage::is_list_line), T_DEFAULT),
+            R::ReadMessage(i) => (format!("AT+CMGR={i}"), matching(sms_storage::is_read_line), T_DEFAULT),
+            R::DeleteMessage(i) => (format!("AT+CMGD={i}"), none, T_DEFAULT),
+            R::SendMessage(pdu) => {
+                let text = format!("AT+CMGS={}", pdu.tpdu_len());
+                let payload = Some(pdu.hex().as_bytes().to_vec());
+                return Command { text, spec: prefixed(&["+CMGS: "]), timeout_ms: T_SEND_SMS, payload };
+            }
         };
         Command { text, spec, timeout_ms, payload: None }
     }
@@ -173,7 +216,10 @@ impl Request {
             | R::SetVerboseErrors
             | R::SetVoiceHangUp
             | R::SetCallerId
-            | R::ClearUrcDelay => {
+            | R::ClearUrcDelay
+            | R::SetPduMode
+            | R::SetNewMessageIndication
+            | R::DeleteMessage(_) => {
                 if info.is_empty() {
                     Ok(Response::Done)
                 } else {
@@ -206,10 +252,21 @@ impl Request {
             R::QueryVoiceHangUp => setting_line("+CVHU: ")(one()?).map(Response::Setting).ok_or_else(bad),
             R::QueryCallerId => setting_line("+CLIP: ")(one()?).map(Response::Setting).ok_or_else(bad),
             R::QueryUrcDelay => setting_line("+CURCD: ")(one()?).map(Response::Setting).ok_or_else(bad),
+            R::QueryPduMode => setting_line("+CMGF: ")(one()?).map(Response::Setting).ok_or_else(bad),
             R::Identify => Ok(Response::Lines(info.to_vec())),
             R::Firmware => one()?
                 .strip_prefix("+CGMR: ")
                 .map(|v| Response::Firmware(v.to_string()))
+                .ok_or_else(bad),
+            R::QueryStorage => sms_storage::parse_usage(one()?).map(Response::Storage).ok_or_else(bad),
+            R::ListMessages => sms_storage::parse_list(info).map(Response::Messages).ok_or_else(bad),
+            R::ReadMessage(i) => {
+                sms_storage::parse_read(*i, info).map(|m| Response::Messages(m.into_iter().collect())).ok_or_else(bad)
+            }
+            R::SendMessage(_) => one()?
+                .strip_prefix("+CMGS: ")
+                .and_then(|r| r.trim().parse().ok())
+                .map(Response::MessageRef)
                 .ok_or_else(bad),
         }
     }
@@ -218,6 +275,8 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modem::sms_pdu::encode_submit;
+    use crate::modem::sms_storage::Status;
     use crate::modem::unsolicited::{CallState, Direction};
 
     fn lines(ls: &[&str]) -> Vec<String> {
@@ -260,6 +319,13 @@ mod tests {
             (Request::QueryUrcDelay, "AT+CURCD?"),
             (Request::Identify, "ATI"),
             (Request::Firmware, "AT+CGMR"),
+            (Request::SetPduMode, "AT+CMGF=0"),
+            (Request::QueryPduMode, "AT+CMGF?"),
+            (Request::SetNewMessageIndication, "AT+CNMI=2,1,0,0,0"),
+            (Request::QueryStorage, "AT+CPMS?"),
+            (Request::ListMessages, "AT+CMGL=4"),
+            (Request::ReadMessage(7), "AT+CMGR=7"),
+            (Request::DeleteMessage(7), "AT+CMGD=7"),
         ];
         for (r, text) in cases {
             assert_eq!(r.command().text, text);
@@ -318,6 +384,7 @@ mod tests {
         assert_eq!(Request::QueryVoiceHangUp.parse(&lines(&["+CVHU: 0"])), Ok(Response::Setting(0)));
         assert_eq!(Request::QueryCallerId.parse(&lines(&["+CLIP: 1,1"])), Ok(Response::Setting(1)));
         assert_eq!(Request::QueryUrcDelay.parse(&lines(&["+CURCD: 0,1"])), Ok(Response::Setting(0)));
+        assert_eq!(Request::QueryPduMode.parse(&lines(&["+CMGF: 1"])), Ok(Response::Setting(1)));
         assert!(Request::QueryCallerId.parse(&[]).is_err());
     }
 
@@ -337,6 +404,50 @@ mod tests {
             Request::Firmware.parse(&lines(&["+CGMR: A011B15A7682M7"])),
             Ok(Response::Firmware("A011B15A7682M7".into()))
         );
+    }
+
+    /// The captured send (`16-sms-send`): length in the command, the PDU
+    /// as the payload (the link adds Ctrl-Z), `+CMGS: <mr>` back.
+    #[test]
+    fn send_message_writes_the_pdu_at_the_prompt() {
+        let pdu = encode_submit("07700900123", "dynatac test: short GSM text", 1).unwrap().remove(0);
+        let r = Request::SendMessage(pdu.clone());
+        let c = r.command();
+        assert_eq!(c.text, "AT+CMGS=39");
+        assert_eq!(c.payload.as_deref(), Some(pdu.hex().as_bytes()));
+        assert_eq!(c.timeout_ms, T_SEND_SMS);
+        assert_eq!(r.parse(&lines(&["+CMGS: 24"])), Ok(Response::MessageRef(24)));
+        assert!(r.parse(&[]).is_err());
+        assert!(r.parse(&lines(&["+CMGS: 256"])).is_err());
+        // Only send carries a payload.
+        assert!(Request::ListMessages.command().payload.is_none());
+    }
+
+    #[test]
+    fn message_listing_and_reading() {
+        let pdu = "0791449785788997040C914477000910320000620102516080400CC4BC3B4C0F8F4169372806";
+        let stored = Stored { index: 2, status: Status::Unread, pdu: pdu.into() };
+        assert_eq!(
+            Request::ListMessages.parse(&lines(&["+CMGL: 2,0,,30", pdu])),
+            Ok(Response::Messages(vec![stored.clone()]))
+        );
+        assert_eq!(Request::ListMessages.parse(&[]), Ok(Response::Messages(vec![])));
+        assert!(Request::ListMessages.parse(&lines(&["+CMGL: 2,0,,30"])).is_err());
+        assert_eq!(
+            Request::ReadMessage(2).parse(&lines(&["+CMGR: 0,\"\",30", pdu])),
+            Ok(Response::Messages(vec![stored]))
+        );
+        assert_eq!(Request::ReadMessage(2).parse(&[]), Ok(Response::Messages(vec![])));
+        // A `+CMTI` arriving mid-listing is a URC, not part of the reply.
+        let Info::Matching(f) = Request::ListMessages.command().spec.info else { panic!() };
+        assert!(f(pdu) && !f("+CMTI: \"SM\",3"));
+    }
+
+    #[test]
+    fn storage_usage() {
+        let r = Request::QueryStorage.parse(&lines(&["+CPMS: \"SM\",7,10,\"SM\",7,10,\"SM\",7,10"])).unwrap();
+        let Response::Storage(u) = r else { panic!() };
+        assert_eq!((u[2].storage.as_str(), u[2].used, u[2].total), ("SM", 7, 10));
     }
 
     #[test]

@@ -26,6 +26,10 @@
 //!     ~13 ms.) It starts unsynced, and becomes unsynced on a timeout, lost
 //!     bytes during a command, a stray final code, or [`Engine::reset`].
 //!     Commands wait while unsynced; URCs keep flowing.
+//!   - A command with a payload (`AT+CMGS`) gets it written at the `> `
+//!     prompt, followed by Ctrl-Z. A prompt nobody wants is answered with
+//!     ESC. Losing sync before the payload went out writes ESC before the
+//!     probe, in case the modem is waiting in input mode.
 //!
 //! Invariants (callee):
 //!   - Every submitted command produces exactly one [`Output::Reply`].
@@ -374,6 +378,12 @@ impl Engine {
         match std::mem::replace(&mut self.state, State::Off) {
             State::Off if reason != UnsyncReason::Reset => return,
             State::Ready(Some(f)) => {
+                // The modem may be waiting for the payload (its prompt lost or
+                // late): the probe would become message text, and the modem
+                // would never answer. ESC cancels input mode.
+                if f.cmd.payload.is_some() && !f.payload_sent {
+                    self.write(vec![ESC]);
+                }
                 let why = unknown.unwrap_or(UnknownReason::Reset);
                 self.reply(f.id, Outcome::Unknown(why), f.info);
             }
@@ -834,6 +844,58 @@ mod tests {
                 reply(id, Outcome::Ok, &["+CMGS: 7"]),
             ]
         );
+    }
+
+    /// Writes only, in order.
+    fn writes(out: &[Output]) -> Vec<Vec<u8>> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Write(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn send_sms() -> Command {
+        Command {
+            text: "AT+CMGS=2".into(),
+            spec: ReplySpec { info: Info::Prefixes(&["+CMGS:"]), extra_finals: &[] },
+            timeout_ms: 60_000,
+            payload: Some(b"00".to_vec()),
+        }
+    }
+
+    /// Found designing the simulator: with the prompt lost (or late), the
+    /// modem may sit in input mode, where the probe would become message
+    /// text and never be answered. ESC first cancels input mode.
+    #[test]
+    fn sync_lost_before_the_payload_cancels_input_mode_first() {
+        for lose in [|r: &mut Rig| r.lost(), |r: &mut Rig| r.advance(60_000)] {
+            let mut r = Rig::synced();
+            let id = r.submit(send_sms());
+            r.take();
+            lose(&mut r);
+            let out = r.take();
+            let w = writes(&out);
+            assert_eq!(w.len(), 2, "{out:?}");
+            assert_eq!(w[0], [ESC]);
+            assert!(w[1].starts_with(b"AT+CURCD="), "{out:?}");
+            assert!(out.iter().any(|o| matches!(o, Output::Reply(rep) if rep.id == id && matches!(rep.outcome, Outcome::Unknown(_)))));
+        }
+    }
+
+    /// Once the payload (and its Ctrl-Z) went out, input mode is over:
+    /// a later sync loss probes directly.
+    #[test]
+    fn sync_lost_after_the_payload_probes_directly() {
+        let mut r = Rig::synced();
+        r.submit(send_sms());
+        r.rx("\r\n> ");
+        r.take();
+        r.lost();
+        let w = writes(&r.take());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with(b"AT+CURCD="));
     }
 
     #[test]

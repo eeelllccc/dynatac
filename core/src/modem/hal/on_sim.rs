@@ -20,8 +20,8 @@ impl Stack {
     fn configured() -> Self {
         let mut s = Stack { hal: Hal::new(), t: SimTransport::new(Sim::new(SimConfig::default())), out: vec![] };
         s.power_on();
-        // The first pass runs before the SIM is ready (CLIP fails); the
-        // re-run at `+CPIN: READY` is clean.
+        // The first pass runs before the SIM is ready (CLIP and SMS fail);
+        // the re-run at `SMS DONE` is clean.
         s.until(30_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
         s.out.clear();
         s
@@ -84,21 +84,86 @@ fn configures_the_modem_after_power_on() {
 }
 
 /// As on hardware: the first configuration pass runs before the SIM is
-/// ready, so caller ID fails; the pass re-runs at `+CPIN: READY`.
+/// ready, so caller ID fails; the pass re-runs at `+CPIN: READY`. The SMS
+/// settings fail until `SMS DONE` (a guess, see `sim.rs`), and are applied
+/// by the re-run then.
 #[test]
-fn caller_id_is_configured_once_the_sim_is_ready() {
+fn sim_dependent_settings_are_configured_once_ready() {
     let mut s = Stack { hal: Hal::new(), t: SimTransport::new(Sim::new(SimConfig::default())), out: vec![] };
     s.power_on();
+    let sms_busy: Vec<String> =
+        ["AT+CMGF=0", "AT+CMGF?", "AT+CNMI=2,1,0,0,0"].iter().map(|c| format!("{c}: Cms(\"SIM busy\")")).collect();
     let first = s.until(30_000, |o| matches!(o, Output::Event(Event::Configured { .. })));
-    assert_eq!(
-        first,
-        Output::Event(Event::Configured { issues: vec!["AT+CLIP=1: Error".into(), "AT+CLIP?: Error".into()] })
-    );
+    let mut issues = vec!["AT+CLIP=1: Error".to_string(), "AT+CLIP?: Error".into()];
+    issues.extend(sms_busy.clone());
+    assert_eq!(first, Output::Event(Event::Configured { issues }));
     s.until(10_000, |o| *o == Output::Event(Event::Urc(Unsolicited::Sim("READY".into()))));
-    s.until(5_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
+    s.until(5_000, |o| *o == Output::Event(Event::Configured { issues: sms_busy.clone() }));
     let now = s.t.now();
     s.t.sim.incoming_call("07700900123", now);
     s.until(1000, |o| matches!(o, Output::Event(Event::Urc(Unsolicited::CallerId { .. }))));
+    s.until(5_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
+}
+
+fn submit_pdu() -> crate::modem::sms_pdu::SubmitPdu {
+    crate::modem::sms_pdu::encode_submit("07700900123", "hello", 1).unwrap().remove(0)
+}
+
+/// Until a pass has read back PDU mode, a send is refused without being
+/// written: in text mode the modem would text the PDU's hex to the
+/// "number" in `AT+CMGS=<length>`.
+#[test]
+fn sms_is_only_sent_once_pdu_mode_is_confirmed() {
+    let mut s = Stack { hal: Hal::new(), t: SimTransport::new(Sim::new(SimConfig::default())), out: vec![] };
+    s.power_on();
+    s.until(30_000, |o| matches!(o, Output::Event(Event::Configured { .. })));
+    let early = s.submit(Request::SendMessage(submit_pdu()));
+    assert_eq!(s.done(early, 1000), Err(RequestError::NotSent));
+    s.until(15_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
+    let id = s.submit(Request::SendMessage(submit_pdu()));
+    assert_eq!(s.done(id, 5000), Ok(Response::MessageRef(0)));
+    let sent = s.t.sim.sent_sms();
+    assert_eq!(sent, [crate::modem::sim::SentSms::Pdu(submit_pdu().hex().into())]);
+}
+
+/// A restart loses PDU mode. A send queued across it is refused (not
+/// written in text mode) until a pass reads PDU mode back, after `SMS DONE`.
+#[test]
+fn pdu_mode_is_restored_after_a_restart() {
+    let mut s = Stack::configured();
+    let now = s.t.now();
+    s.t.sim.cut_power(now);
+    s.t.sim.power_on(now);
+    s.until(30_000, |o| *o == Output::Event(Event::Restarted));
+    let queued = s.submit(Request::SendMessage(submit_pdu()));
+    assert_eq!(s.done(queued, 30_000), Err(RequestError::NotSent));
+    assert_eq!(s.t.sim.sent_sms(), []);
+    s.until(30_000, |o| *o == Output::Event(Event::Configured { issues: vec![] }));
+    let id = s.submit(Request::SendMessage(submit_pdu()));
+    assert_eq!(s.done(id, 5000), Ok(Response::MessageRef(0)));
+    assert!(matches!(s.t.sim.sent_sms(), [crate::modem::sim::SentSms::Pdu(_)]));
+}
+
+/// Receive, list, read, delete through the whole stack.
+#[test]
+fn sms_round_trip_through_the_stack() {
+    let mut s = Stack::configured();
+    let pdu = "0791449785788997040C914477000910320000620102516080400CC4BC3B4C0F8F4169372806";
+    let now = s.t.now();
+    assert_eq!(s.t.sim.receive_sms(pdu, now), Some(1));
+    s.until(1000, |o| {
+        *o == Output::Event(Event::Urc(Unsolicited::NewSms { storage: "SM".into(), index: 1 }))
+    });
+    let list = s.submit(Request::ListMessages);
+    let Ok(Response::Messages(m)) = s.done(list, 1000) else { panic!() };
+    assert_eq!((m.len(), m[0].index, m[0].pdu.as_str()), (1, 1, pdu));
+    let read = s.submit(Request::ReadMessage(1));
+    assert!(matches!(s.done(read, 1000), Ok(Response::Messages(m)) if m.len() == 1));
+    let del = s.submit(Request::DeleteMessage(1));
+    assert_eq!(s.done(del, 1000), Ok(Response::Done));
+    let empty = s.submit(Request::ReadMessage(1));
+    assert!(matches!(s.done(empty, 1000), Err(RequestError::Failed(_))));
+    assert!(s.t.sim.messages().is_empty());
 }
 
 #[test]

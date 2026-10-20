@@ -21,6 +21,11 @@
 //!     re-run at each boot milestone (`+CPIN: READY`, `SMS DONE`,
 //!     `PB DONE`), each followed by a fresh `Configured`. Each milestone
 //!     arrives once per boot, so re-runs are bounded.
+//!   - SMS PDU mode (`AT+CMGF=0`) is part of the configuration: it is lost
+//!     at every restart, and in text mode `AT+CMGS=<length>` would send
+//!     the PDU's hex as a text to the number `<length>`. So a
+//!     `SendMessage` is only sent when the latest pass read PDU mode back;
+//!     otherwise it settles `NotSent` at once.
 //!
 //! Invariants (callee):
 //!   - Every submitted request gets exactly one [`Output::Done`].
@@ -99,6 +104,9 @@ pub fn config_steps() -> Vec<(Request, Option<Response>)> {
         (R::QueryCallerId, Some(Response::Setting(1))),
         (R::SetOutputGain(Gain::MAX), None),
         (R::QueryOutputGain, Some(Response::Gain(Gain::MAX))),
+        (R::SetPduMode, None),
+        (R::QueryPduMode, Some(Response::Setting(0))),
+        (R::SetNewMessageIndication, None),
     ]
 }
 
@@ -122,6 +130,8 @@ pub struct Hal {
     retry_config: bool,
     /// A milestone arrived mid-pass: start again when this pass ends.
     rerun_pending: bool,
+    /// The latest configuration pass read back PDU mode (see module docs).
+    pdu_mode: bool,
     steps: Vec<(Request, Option<Response>)>,
     queue: VecDeque<(RequestId, Request)>,
     in_flight: Option<(CommandId, Pending)>,
@@ -137,6 +147,7 @@ impl Hal {
             phase: Phase::Off,
             retry_config: false,
             rerun_pending: false,
+            pdu_mode: false,
             steps: config_steps(),
             queue: VecDeque::new(),
             in_flight: None,
@@ -292,7 +303,11 @@ impl Hal {
                 match (r.outcome, expect) {
                     (link::Outcome::Ok, None) => {}
                     (link::Outcome::Ok, Some(want)) => match request.parse(&r.info) {
-                        Ok(got) if &got == want => {}
+                        Ok(got) if &got == want => {
+                            if *request == Request::QueryPduMode {
+                                self.pdu_mode = true;
+                            }
+                        }
                         Ok(got) => issues.push(format!("{text}: expected {want:?}, got {got:?}")),
                         Err(lines) => issues.push(format!("{text}: unexpected reply {lines:?}")),
                     },
@@ -312,6 +327,9 @@ impl Hal {
         }
         match &mut self.phase {
             Phase::Configuring { step, issues } => {
+                if *step == 0 {
+                    self.pdu_mode = false;
+                }
                 if *step < self.steps.len() {
                     let i = *step;
                     let cid = self.engine.submit(self.steps[i].0.command(), now);
@@ -330,6 +348,10 @@ impl Hal {
             }
             Phase::Ready => {
                 let Some((id, request)) = self.queue.pop_front() else { return false };
+                if matches!(request, Request::SendMessage(_)) && !self.pdu_mode {
+                    self.done(id, Err(RequestError::NotSent));
+                    return true;
+                }
                 let cid = self.engine.submit(request.command(), now);
                 self.in_flight = Some((cid, Pending::User(id, request)));
                 true
@@ -363,6 +385,7 @@ mod tests {
             "AT+CLIP?" => "\r\n+CLIP: 1,1\r\n\r\nOK\r\n",
             "AT+COUTGAIN?" => "\r\n+COUTGAIN: 7\r\n\r\nOK\r\n",
             "AT+CURCD?" => "\r\n+CURCD: 0,1\r\n\r\nOK\r\n",
+            "AT+CMGF?" => "\r\n+CMGF: 0\r\n\r\nOK\r\n",
             _ => "\r\nOK\r\n",
         }
     }
@@ -476,7 +499,7 @@ mod tests {
             sent,
             [
                 "ATE0", "AT+CURCD=0,1", "AT+CURCD?", "AT+CMEE=2", "AT+CMEE?", "AT+CVHU=0", "AT+CVHU?", "AT+CLIP=1", "AT+CLIP?",
-                "AT+COUTGAIN=7", "AT+COUTGAIN?"
+                "AT+COUTGAIN=7", "AT+COUTGAIN?", "AT+CMGF=0", "AT+CMGF?", "AT+CNMI=2,1,0,0,0"
             ]
         );
         assert_eq!(r.events, [Event::Configured { issues: vec![] }]);

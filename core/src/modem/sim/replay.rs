@@ -7,16 +7,23 @@
 //!     progress (`+CLCC` stat 2/3 URCs), the voice bearer (`+CGEV: NW ACT`),
 //!     the far end answering (`VOICE CALL: BEGIN` with no `ATA`), hanging
 //!     up (`+CGEV: NW DEACT` with no `AT+CHUP`), calling (first `RING`) or
-//!     giving up (`+CLCC` stat 6 on an unanswered incoming call).
+//!     giving up (`+CLCC` stat 6 on an unanswered incoming call), an SMS
+//!     arriving (`+CMTI`, with the PDU the trace later lists at that index);
+//!   - the SIM's contents at the start: messages the first listing shows
+//!     that weren't announced before it, and the message reference counter
+//!     (the first `+CMGS: <mr>`).
 //!
 //! Everything else is the simulator's own behaviour, and its output lines
 //! must equal the real modem's, in order, each within `TOLERANCE_MS` of
-//! the real time (call durations within 1 s). One captured race is allowed: whether the bearer URC
-//! lands just before or just after `ATD`'s `OK` (see `golden_traces.rs`).
+//! the real time (call durations within 1 s). Two captured races are allowed: whether the bearer URC
+//! lands just before or just after `ATD`'s `OK`, and on hang-up whether the
+//! bearer goes down just before or just after `+CLCC` stat 6 (see
+//! `golden_traces.rs`).
 
 use crate::modem::at::{AtEvent, AtParser};
 use crate::modem::link::Millis;
-use crate::modem::sim::{Sim, SimConfig};
+use crate::modem::sim::{Sim, SimConfig, SimSms};
+use crate::modem::sms_storage::{self, Status};
 use crate::modem::trace::{parse_trace, timeline, Direction, Step, TraceRecord};
 
 macro_rules! fixture {
@@ -39,6 +46,9 @@ const ALL: &[(&str, &str)] = &[
     fixture!("10-soft-power-cycle"),
     fixture!("11-hard-power-cut"),
     fixture!("12-command-during-urc"),
+    fixture!("14-sms-receive-idle"),
+    fixture!("15-sms-receive-in-call"),
+    fixture!("16-sms-send"),
 ];
 
 /// How far each simulated line may be from the real one. The boot-time
@@ -61,6 +71,67 @@ enum Input {
     RemoteAnswer,
     RemoteHangUp,
     IncomingCall,
+    ReceiveSms(String),
+    /// On the SIM before the trace starts.
+    Stored(SimSms),
+    NextMessageReference(u8),
+}
+
+/// Every stored message the trace lists (`+CMGL` / `+CMGR` + PDU line):
+/// (time, index if listed, status, PDU), in trace order.
+fn listed(records: &[TraceRecord]) -> Vec<(Millis, Option<u32>, Status, String)> {
+    let lines: Vec<(Millis, String)> = timeline(records)
+        .into_iter()
+        .filter_map(|s| match s.step {
+            Step::Line(l) => Some((s.t_ms, l)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for pair in lines.windows(2) {
+        let ((t, head), (_, pdu)) = (&pair[0], &pair[1]);
+        let info = [head.clone(), pdu.clone()];
+        if let Some(m) = sms_storage::parse_list(&info).and_then(|mut l| l.pop()) {
+            out.push((*t, Some(m.index), m.status, m.pdu));
+        } else if let Some(Some(m)) = sms_storage::parse_read(0, &info) {
+            out.push((*t, None, m.status, m.pdu));
+        }
+    }
+    out
+}
+
+/// SMS inputs: arrivals at each `+CMTI` (PDU from the later listing),
+/// the SIM's starting contents, and the message reference counter.
+fn sms_inputs(records: &[TraceRecord]) -> Vec<(Millis, Input)> {
+    let listed = listed(records);
+    let pdu_at = |index: u32| listed.iter().find(|(_, i, _, _)| *i == Some(index)).map(|(_, _, _, p)| p.clone());
+    let mut out = Vec::new();
+    let mut announced = Vec::new();
+    for s in timeline(records) {
+        if let Step::Line(l) = &s.step {
+            if let Some(i) = l.strip_prefix("+CMTI: \"SM\",").and_then(|i| i.parse::<u32>().ok()) {
+                out.push((s.t_ms, Input::ReceiveSms(pdu_at(i).expect("an announced message is listed later"))));
+                announced.push((s.t_ms, i));
+            }
+        }
+    }
+    // The first listing: its indices count up; the next listing starts over.
+    let mut first_listing: Vec<_> = listed.iter().filter(|(_, i, _, _)| i.is_some()).collect();
+    if let Some(end) = first_listing.windows(2).position(|w| w[1].1 <= w[0].1) {
+        first_listing.truncate(end + 1);
+    }
+    for (t, index, status, pdu) in first_listing {
+        let index = index.unwrap();
+        if !announced.iter().any(|&(at, i)| i == index && at < *t) {
+            out.push((0, Input::Stored(SimSms { index, status: *status, pdu: pdu.clone() })));
+        }
+    }
+    let mr = timeline(records).into_iter().find_map(|s| match s.step {
+        Step::Line(l) => l.strip_prefix("+CMGS: ").and_then(|m| m.parse().ok()),
+        _ => None,
+    });
+    out.extend(mr.map(|m| (0, Input::NextMessageReference(m))));
+    out
 }
 
 /// The inputs the real modem received, read off the trace.
@@ -128,6 +199,7 @@ fn inputs(records: &[TraceRecord]) -> Vec<(Millis, Input)> {
             _ => {}
         }
     }
+    out.extend(sms_inputs(records));
     out.sort_by_key(|(t, _)| *t); // stable: same-time inputs keep trace order
     out
 }
@@ -146,6 +218,11 @@ fn run_sim(inputs: Vec<(Millis, Input)>, until: Millis) -> Vec<(Millis, String)>
             Input::RemoteAnswer => sim.remote_answer(t),
             Input::RemoteHangUp => sim.remote_hang_up(t),
             Input::IncomingCall => sim.incoming_call(NUMBER, t),
+            Input::ReceiveSms(pdu) => {
+                sim.receive_sms(&pdu, t).expect("the simulated SIM stores it");
+            }
+            Input::Stored(m) => sim.store_sms(m),
+            Input::NextMessageReference(mr) => sim.set_next_message_reference(mr),
         }
     }
     sim.advance(until);
@@ -161,11 +238,14 @@ fn run_sim(inputs: Vec<(Millis, Input)>, until: Millis) -> Vec<(Millis, String)>
     lines
 }
 
-/// The one captured race: `+CGEV: NW ACT` just before `ATD`'s `OK` is the
-/// same behaviour as just after it.
+/// The captured races: `+CGEV: NW ACT` just before `ATD`'s `OK` is the
+/// same behaviour as just after it; on hang-up, `+CGEV: NW DEACT` before
+/// the `+CLCC` stat 6 the same as just after it.
 fn normalise(mut lines: Vec<(Millis, String)>) -> Vec<(Millis, String)> {
+    let call_ended = |l: &str| l.starts_with("+CLCC: ") && l.split(',').nth(2) == Some("6");
     for i in 0..lines.len().saturating_sub(1) {
-        if lines[i].1 == "+CGEV: NW ACT 8,10" && lines[i + 1].1 == "OK" {
+        let (a, b) = (lines[i].1.as_str(), lines[i + 1].1.as_str());
+        if (a == "+CGEV: NW ACT 8,10" && b == "OK") || (call_ended(a) && b == "+CGEV: NW DEACT 8,10") {
             lines.swap(i, i + 1);
         }
     }
@@ -235,7 +315,7 @@ fn replay_exercises_every_kind_of_input() {
     }
     for kind in [
         "Write", "PowerOn", "PowerOff", "CutPower", "Dialling", "Alerting", "Bearer", "RemoteAnswer",
-        "RemoteHangUp", "IncomingCall",
+        "RemoteHangUp", "IncomingCall", "ReceiveSms", "Stored", "NextMessageReference",
     ] {
         assert!(seen.contains(kind), "no {kind} input in any trace");
     }

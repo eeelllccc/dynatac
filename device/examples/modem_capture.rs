@@ -598,7 +598,7 @@ fn submit(kind: Entry, text: &str, sender: &mut Sender, term: &mut Terminal, sta
                 // PDU mode first: the PDU is meaningless in text mode.
                 sender.enqueue("AT+CMGF=0");
                 for p in parts {
-                    sender.enqueue_with_payload(&format!("AT+CMGS={}", p.tpdu_len), &p.hex, SEND_TIMEOUT);
+                    sender.enqueue_with_payload(&format!("AT+CMGS={}", p.tpdu_len()), p.hex(), SEND_TIMEOUT);
                 }
             }
             Err(e) => term.push_output(&format!("cannot encode: {:?}", e)),
