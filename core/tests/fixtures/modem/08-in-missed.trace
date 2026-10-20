@@ -1,0 +1,48 @@
+TRACE 93 # capture start
+TRACE 98 # ri high
+TRACE 1883 # power_en high
+TRACE 1983 # pwrkey on-pulse start
+TRACE 2993 # pwrkey on-pulse end
+TRACE 9027 < \r\n*ATREADY: 1\r\n
+TRACE 10992 < \r\n+CPIN: READY\r\n
+TRACE 11463 # ri low
+TRACE 11577 < \r\nSMS DONE\r\n
+TRACE 11579 # ri high
+TRACE 13358 < \r\n+CGEV: EPS PDN ACT 1\r\n
+TRACE 21184 < \r\nPB DONE\r\n
+TRACE 23001 > ATE0\r
+TRACE 23011 < ATE0\r\r\nOK\r\n
+TRACE 23025 > AT+CMEE=2\r
+TRACE 23035 < \r\nOK\r\n
+TRACE 23041 > AT+CVHU=0\r
+TRACE 23052 < \r\nOK\r\n
+TRACE 23058 > AT+CLCC=1\r
+TRACE 23081 < \r\nERROR\r\n
+TRACE 23086 > AT+CLIP=1\r
+TRACE 23188 < \r\nOK\r\n
+TRACE 23192 > AT+COUTGAIN=7\r
+TRACE 23461 < \r\nOK\r\n
+TRACE 24023 > ATI\r
+TRACE 24048 < \r\nManufacturer: INCORPORATED\r\nModel: A7682E\r\nRevision: A7682M7_V1.11.1\r\nIMEI: 000000000000000\r\n+GCAP: +CGSM,+FCLASS,+DS\r
+TRACE 24053 < \n\r\nOK\r\n
+TRACE 24058 > AT+CGMR\r
+TRACE 24069 < \r\n+CGMR: A011B15A7682M7\r\n\r\nOK\r\n
+TRACE 40697 # mark: incoming
+TRACE 47358 < \r\nRING\r\n
+TRACE 47361 # ri low
+TRACE 47385 < \r\n+CLIP: "07700900123",129\r\n
+TRACE 47397 < \r\n+CLCC: 1,1,4,0,0,"07700900123",129,""\r\n
+TRACE 53263 # ri high
+TRACE 53362 < \r\nRING\r\n\r\n+CLIP: "07700900123",129\r\n
+TRACE 53365 # ri low
+TRACE 59263 # ri high
+TRACE 59363 # ri low
+TRACE 59366 < \r\nRING\r\n\r\n+CLIP: "07700900123",129\r\n
+TRACE 60597 # mark: caller gives up
+TRACE 65263 # ri high
+TRACE 65363 # ri low
+TRACE 65366 < \r\nRING\r\n\r\n+CLIP: "07700900123",129\r\n
+TRACE 67909 < \r\n+CLCC: 1,1,6,0,0,"07700900123",129,""\r\n\r\nVOICE CALL: END\r\n\r\nNO CARRIER\r\n
+TRACE 67912 # ri high
+TRACE 81621 > AT+CLCC\r
+TRACE 81641 < \r\nOK\r\n

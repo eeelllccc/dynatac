@@ -1,0 +1,28 @@
+TRACE 84 # capture start
+TRACE 88 # ri high
+TRACE 1873 # power_en high
+TRACE 1974 # pwrkey on-pulse start
+TRACE 2983 # pwrkey on-pulse end
+TRACE 8983 < \r\n*ATREADY: 1\r\n
+TRACE 10953 < \r\n+CPIN: READY\r\n
+TRACE 11383 # ri low
+TRACE 11496 < \r\nSMS DONE\r\n
+TRACE 11499 # ri high
+TRACE 13722 < \r\n+CGEV: EPS PDN ACT 1\r\n
+TRACE 21144 < \r\nPB DONE\r\n
+TRACE 51943 # mark: dial
+TRACE 77488 > ATD07700900123;\r
+TRACE 77500 < ATD07700900123;\r
+TRACE 78108 < \r\n+CGEV: NW ACT 8,10\r\n\r\nOK\r\n
+TRACE 80001 < \r\n+CLCC: 1,0,2,0,0,"07700900123",129,""\r\n
+TRACE 81041 < \r\n+CLCC: 1,0,3,0,0,"07700900123",129,""\r\n
+TRACE 87074 < \r\nVOICE CALL: BEGIN\r\n\r\n+CLCC: 1,0,0,0,0,"07700900123",129,""\r\n
+TRACE 87090 < \r\n+COLP: "07700900123",129\r\n
+TRACE 96310 # mark: answered
+TRACE 118199 # mark: remote hangs up
+TRACE 122487 < \r\n+CGEV: NW DEACT 8,10\r\n
+TRACE 122582 < \r\n+CLCC: 1,0,6,0,0,"07700900123",129,""\r\n
+TRACE 122833 < \r\nVOICE CALL: END: 000035\r\n\r\nNO CARRIER\r\n
+TRACE 138988 > AT+CLCC\r
+TRACE 138999 < AT+CLCC\r
+TRACE 139009 < \r\nOK\r\n

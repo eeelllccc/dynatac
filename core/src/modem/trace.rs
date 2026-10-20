@@ -27,6 +27,8 @@
 
 use std::fmt;
 
+use super::at::{AtEvent, AtParser};
+
 const PREFIX: &str = "TRACE ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,55 @@ pub fn parse_trace(text: &str) -> Result<Vec<TraceRecord>, (usize, TraceError)> 
     }
     records.sort_by_key(|r| r.t_ms);
     Ok(records)
+}
+
+/// One protocol-level event in a trace: what a reader of the AT dialogue
+/// cares about, with chunk boundaries gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// A command we sent, without its trailing `\r`.
+    Sent(String),
+    /// A complete line from the modem (empty lines dropped, as `AtParser`).
+    Line(String),
+    /// The modem's `> ` prompt.
+    Prompt,
+    /// A capture-tool note (marker, power event, RI edge).
+    Note(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedStep {
+    pub t_ms: u64,
+    pub step: Step,
+}
+
+/// The trace as a sequence of protocol steps. Received bytes go through
+/// one `AtParser` in order, so lines split across chunks are rejoined;
+/// a line is timed by the chunk that completed it.
+///
+/// Requires `records` in time order (as `parse_trace` returns them).
+pub fn timeline(records: &[TraceRecord]) -> Vec<TimedStep> {
+    let mut parser = AtParser::new();
+    let mut steps = Vec::new();
+    for r in records {
+        let at = |step| TimedStep { t_ms: r.t_ms, step };
+        match r.dir {
+            Direction::Rx => steps.extend(parser.feed(&r.bytes).into_iter().map(|e| {
+                at(match e {
+                    AtEvent::Line(l) => Step::Line(l),
+                    AtEvent::Prompt => Step::Prompt,
+                })
+            })),
+            Direction::Tx => {
+                let text = String::from_utf8_lossy(&r.bytes);
+                steps.push(at(Step::Sent(text.trim_end_matches('\r').to_string())));
+            }
+            Direction::Note => {
+                steps.push(at(Step::Note(String::from_utf8_lossy(&r.bytes).into_owned())))
+            }
+        }
+    }
+    steps
 }
 
 pub fn escape(bytes: &[u8]) -> String {
@@ -281,6 +332,46 @@ TRACE 20 # after-ok
                 TraceRecord::new(20, Direction::Note, b"after-ok"),
             ]
         );
+    }
+
+    #[test]
+    fn timeline_rejoins_lines_split_across_chunks() {
+        // Real split seen in every `ATI` reply: chunk ends mid line-ending.
+        let records = [
+            TraceRecord::new(1, Direction::Tx, b"ATI\r"),
+            TraceRecord::new(2, Direction::Rx, b"\r\nModel: A7682E\r\n+GCAP: +DS\r"),
+            TraceRecord::new(3, Direction::Rx, b"\n\r\nOK\r\n"),
+            TraceRecord::new(4, Direction::Note, b"mark: done"),
+        ];
+        let steps: Vec<_> = timeline(&records).into_iter().map(|s| (s.t_ms, s.step)).collect();
+        assert_eq!(
+            steps,
+            vec![
+                (1, Step::Sent("ATI".into())),
+                (2, Step::Line("Model: A7682E".into())),
+                (2, Step::Line("+GCAP: +DS".into())),
+                (3, Step::Line("OK".into())),
+                (4, Step::Note("mark: done".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_times_a_line_by_the_chunk_that_completes_it() {
+        let records = [
+            TraceRecord::new(10, Direction::Rx, b"\r\nVOICE CA"),
+            TraceRecord::new(20, Direction::Rx, b"LL: BEGIN\r\n"),
+        ];
+        assert_eq!(
+            timeline(&records),
+            vec![TimedStep { t_ms: 20, step: Step::Line("VOICE CALL: BEGIN".into()) }]
+        );
+    }
+
+    #[test]
+    fn timeline_emits_prompt() {
+        let records = [TraceRecord::new(5, Direction::Rx, b"\r\n> ")];
+        assert_eq!(timeline(&records), vec![TimedStep { t_ms: 5, step: Step::Prompt }]);
     }
 
     #[test]

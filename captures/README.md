@@ -4,6 +4,13 @@ Raw A7682E UART traces recorded on hardware with `device/examples/modem_capture.
 They are the ground truth the modem simulator is checked against (see `todo.md`,
 "Modem stack rework"). Format: `core/src/modem/trace.rs`.
 
+## Fixtures
+
+`./captures/make-fixtures.sh` turns these logs into `core/tests/fixtures/modem/*.trace`:
+TRACE records only, capture-tool diagnostics dropped, the dialled number replaced by
+`07700900123` and the IMEI zeroed. `core/tests/golden_traces.rs` asserts each finding
+below against them. Add new captures to the script's list.
+
 ## Recording
 
 ```

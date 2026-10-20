@@ -7,9 +7,11 @@
 //!
 //!   ./flash-example.sh modem_capture | tee captures/<scenario>.log
 //!
-//! Capture never misses a byte because of the UI: a dedicated RX thread is
-//! the only UART reader (8 KB buffer) and also samples RI, while the main
-//! thread handles keyboard, screen and sending. Commands are sent one at a
+//! Capture never misses a byte because of the UI: the L0 transport
+//! (`src/modem_transport.rs`) reads the UART on its own thread into a
+//! 16 KB pipe and reports any loss as `# LOST` in the trace. A second
+//! thread logs what it receives and samples RI, while the main thread
+//! handles keyboard, screen and sending. Commands are sent one at a
 //! time — the next is only sent after a final result code (or a 10 s
 //! timeout), as the AT manual requires.
 //!
@@ -31,6 +33,8 @@ mod display;
 mod i2c_bus;
 #[path = "../src/keyboard.rs"]
 mod keyboard;
+#[path = "../src/modem_transport.rs"]
+mod modem_transport;
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -39,13 +43,13 @@ use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::{
     gpio::{
-        AnyIOPin, AnyInputPin, AnyOutputPin, Gpio7, IOPin, Input, InputPin, Output, OutputPin,
-        PinDriver, Pull,
+        AnyInputPin, AnyOutputPin, Gpio7, IOPin, Input, InputPin, Output, OutputPin, PinDriver,
+        Pull,
     },
     i2c::{I2cConfig, I2cDriver},
     peripherals::Peripherals,
     spi::{config::DriverConfig, Dma, SpiConfig, SpiDeviceDriver, SpiDriver},
-    uart::{config::Config as UartConfig, UartDriver, UartRxDriver, UartTxDriver},
+    uart::UartTxDriver,
     units::Hertz,
 };
 
@@ -54,15 +58,17 @@ use dynatac_core::battery::{BQ27220_ADDR, REG_VOLTAGE};
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::modem::at::{classify, AtEvent, AtParser, LineClass};
 use dynatac_core::modem::trace::{Direction, TraceRecord};
+use dynatac_core::modem::transport::{Rx, RxReader};
 use dynatac_core::terminal::{Terminal, TerminalAction};
 use i2c_bus::{I2cBus, I2cDevice};
 use keyboard::Keyboard;
+use modem_transport::{write_all, UartTransport};
 
 const KEYBOARD_ADDR: u8 = 0x34;
 const ROW_HEIGHT: u16 = 10;
 const COLS: usize = 30;
 const ROWS: usize = (display::HEIGHT / ROW_HEIGHT) as usize;
-const RX_BUFFER: usize = 8192;
+const RX_PIPE: usize = 16 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(300);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -93,16 +99,15 @@ fn note(start: Instant, text: &str) {
     emit(start, Direction::Note, text.as_bytes());
 }
 
-/// Sole reader of the modem UART. Logs every chunk as it arrives and
-/// forwards it to the UI thread; samples RI between reads (≤ 1 tick apart,
-/// fine for RI's ≥ 60 ms pulses).
+/// Logs every received chunk (and loss) as it arrives and forwards it to
+/// the UI thread; samples RI between reads (≤ 10 ms apart, fine for RI's
+/// ≥ 60 ms pulses).
 fn rx_loop(
-    rx: UartRxDriver<'static>,
+    rx: RxReader,
     ri: PinDriver<'static, Gpio7, Input>,
     start: Instant,
-    to_ui: mpsc::Sender<Vec<u8>>,
+    to_ui: mpsc::Sender<Rx>,
 ) {
-    let mut buf = [0u8; 512];
     let mut ri_low = ri.is_low();
     let mut last_beat = Instant::now();
     note(start, if ri_low { "ri low" } else { "ri high" });
@@ -111,11 +116,16 @@ fn rx_loop(
             last_beat = Instant::now();
             note(start, "rx alive");
         }
-        if let Ok(n) = rx.read(&mut buf, 1) {
-            if n > 0 {
-                emit(start, Direction::Rx, &buf[..n]);
-                let _ = to_ui.send(buf[..n].to_vec());
+        match rx.read(Duration::from_millis(10)) {
+            Some(Rx::Data(d)) => {
+                emit(start, Direction::Rx, &d);
+                let _ = to_ui.send(Rx::Data(d));
             }
+            Some(Rx::Lost) => {
+                note(start, "LOST");
+                let _ = to_ui.send(Rx::Lost);
+            }
+            None => {}
         }
         let low = ri.is_low();
         if low != ri_low {
@@ -159,7 +169,7 @@ impl Sender {
         let mut bytes = cmd.clone().into_bytes();
         bytes.push(b'\r');
         emit(start, Direction::Tx, &bytes);
-        if let Err(e) = self.tx.write(&bytes) {
+        if let Err(e) = write_all(&mut self.tx, &bytes) {
             note(start, &format!("tx error: {:?}", e));
         }
         self.in_flight = Some((cmd.clone(), Instant::now()));
@@ -271,12 +281,9 @@ fn main() {
     // TCA8418 interrupt output (active low): asserted while key events wait.
     let kb_irq = PinDriver::input(pins.gpio15.downgrade_input()).unwrap();
 
-    let uart = UartDriver::new(
-        peripherals.uart1, pins.gpio10, pins.gpio11,
-        None::<AnyIOPin>, None::<AnyIOPin>,
-        &UartConfig::new().baudrate(Hertz(115_200)).rx_fifo_size(RX_BUFFER),
-    ).unwrap();
-    let (tx, rx) = uart.into_split();
+    let (tx, rx) = UartTransport::start(peripherals.uart1, pins.gpio10, pins.gpio11, RX_PIPE)
+        .unwrap()
+        .into_parts();
 
     let mut ri = PinDriver::input(pins.gpio7).unwrap();
     ri.set_pull(Pull::Up).unwrap();
@@ -286,7 +293,7 @@ fn main() {
     let _ = pwrkey.set_low();
 
     note(start, "capture start");
-    let (to_ui, from_rx) = mpsc::channel::<Vec<u8>>();
+    let (to_ui, from_rx) = mpsc::channel::<Rx>();
     thread::Builder::new()
         .stack_size(8 * 1024)
         .spawn(move || rx_loop(rx, ri, start, to_ui))
@@ -319,7 +326,17 @@ fn main() {
         health.beat(&mut kb, &gauge, &kb_irq, start);
 
         // Received bytes → display lines; final codes release the sender.
-        while let Ok(chunk) = from_rx.try_recv() {
+        while let Ok(rx) = from_rx.try_recv() {
+            let chunk = match rx {
+                Rx::Data(d) => d,
+                Rx::Lost => {
+                    // The partial line on either side of a gap is corrupt.
+                    parser.reset();
+                    term.push_output("! bytes lost");
+                    dirty = true;
+                    continue;
+                }
+            };
             for event in parser.feed(&chunk) {
                 match event {
                     AtEvent::Line(line) => {

@@ -65,3 +65,7 @@ embedded-hal = "1"
 
 [build-dependencies]
 embuild = "0.33"
+
+[[example]]
+name = "transport_soak"
+harness = false

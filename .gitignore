@@ -4,3 +4,7 @@
 /Cargo.lock
 T-Deck-Pro
 
+
+# Raw modem capture logs: contain phone numbers and the IMEI.
+# Scrubbed copies live in core/tests/fixtures/modem/ (captures/make-fixtures.sh).
+captures/*.log

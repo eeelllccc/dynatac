@@ -1,0 +1,60 @@
+TRACE 93 # capture start
+TRACE 98 # ri high
+TRACE 1883 # power_en high
+TRACE 1983 # pwrkey on-pulse start
+TRACE 2993 # pwrkey on-pulse end
+TRACE 9015 < \r\n*ATREADY: 1\r\n
+TRACE 10980 < \r\n+CPIN: READY\r\n
+TRACE 11453 # ri low
+TRACE 11569 < \r\nSMS DONE\r\n
+TRACE 11571 # ri high
+TRACE 13345 < \r\n+CGEV: EPS PDN ACT 1\r\n
+TRACE 21173 < \r\nPB DONE\r\n
+TRACE 23911 > ATE0\r
+TRACE 23919 < ATE0\r\r\nOK\r\n
+TRACE 23924 > AT+CMEE=2\r
+TRACE 23934 < \r\nOK\r\n
+TRACE 23944 > AT+CVHU=0\r
+TRACE 23954 < \r\nOK\r\n
+TRACE 23960 > AT+CLCC=1\r
+TRACE 23980 < \r\nERROR\r\n
+TRACE 23984 > AT+CLIP=1\r
+TRACE 24083 < \r\nOK\r\n
+TRACE 24093 > AT+COUTGAIN=7\r
+TRACE 24359 < \r\nOK\r\n
+TRACE 24923 > ATI\r
+TRACE 24949 < \r\nManufacturer: INCORPORATED\r\nModel: A7682E\r\nRevision: A7682M7_V1.11.1\r\nIMEI: 000000000000000\r\n+GCAP: +CGSM,+FCLASS,+DS\r
+TRACE 24954 < \n\r\nOK\r\n
+TRACE 24965 > AT+CGMR\r
+TRACE 24978 < \r\n+CGMR: A011B15A7682M7\r\n\r\nOK\r\n
+TRACE 34347 # mark: off
+TRACE 38163 # pwrkey off-pulse start
+TRACE 41173 # pwrkey off-pulse end
+TRACE 41559 < \r\n+CGEV: ME DETACH\r\n
+TRACE 56177 # mark: on
+TRACE 60563 # pwrkey on-pulse start
+TRACE 61573 # pwrkey on-pulse end
+TRACE 67529 < \r\n*ATREADY: 1\r\n
+TRACE 69493 < \r\n+CPIN: READY\r\n
+TRACE 69963 # ri low
+TRACE 70078 < \r\nSMS DONE\r\n
+TRACE 70080 # ri high
+TRACE 71323 < \r\n+CGEV: EPS PDN ACT 1\r\n
+TRACE 79685 < \r\nPB DONE\r\n
+TRACE 96421 > ATE0\r
+TRACE 96429 < ATE0\r\r\nOK\r\n
+TRACE 96434 > AT+CMEE=2\r
+TRACE 96445 < \r\nOK\r\n
+TRACE 96451 > AT+CVHU=0\r
+TRACE 96461 < \r\nOK\r\n
+TRACE 96467 > AT+CLCC=1\r
+TRACE 96493 < \r\nERROR\r\n
+TRACE 96497 > AT+CLIP=1\r
+TRACE 96591 < \r\nOK\r\n
+TRACE 96597 > AT+COUTGAIN=7\r
+TRACE 96863 < \r\nOK\r\n
+TRACE 97451 > ATI\r
+TRACE 97478 < \r\nManufacturer: INCORPORATED\r\nModel: A7682E\r\nRevision: A7682M7_V1.11.1\r\nIMEI: 000000000000000\r\n+GCAP: +CGSM,+FCLASS,+DS\r
+TRACE 97483 < \n\r\nOK\r\n
+TRACE 97488 > AT+CGMR\r
+TRACE 97501 < \r\n+CGMR: A011B15A7682M7\r\n\r\nOK\r\n

@@ -25,6 +25,7 @@
 
 pub mod at;
 pub mod trace;
+pub mod transport;
 
 pub use at::{classify, AtEvent, AtParser, LineClass, Urc};
 
