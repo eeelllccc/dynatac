@@ -24,6 +24,10 @@
 //!   l  list calls (AT+CLCC)   t  type any command   m  add a marker note
 //!   n  PWRKEY power-on pulse  o  PWRKEY power-off pulse
 //!   x  hard power cut (POWER_EN low 3 s) then power on
+//!   s  SMS state (read only): CPMS=?, CPMS?, CNMI?, CMGF?, CSCA?, CSMS?
+//!   p  PDU mode (AT+CMGF=0)   k  new-SMS indication (AT+CNMI=2,1,0,0,0)
+//!   g  list all stored SMS (AT+CMGL=4, PDU mode)
+//!   w  send a short GSM text  u  send a 2-part UCS2 text (to a number entered)
 //!   ?  show this help
 //! In text entry: Enter submits, Alt+Backspace cancels.
 
@@ -57,6 +61,7 @@ use display::Epd;
 use dynatac_core::battery::{BQ27220_ADDR, REG_VOLTAGE};
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::modem::at::{classify, AtEvent, AtParser, LineClass};
+use dynatac_core::modem::sms_pdu;
 use dynatac_core::modem::trace::{Direction, TraceRecord};
 use dynatac_core::modem::transport::{Rx, RxReader};
 use dynatac_core::terminal::{Terminal, TerminalAction};
@@ -79,11 +84,22 @@ const INIT_COMMANDS: &[&str] = &[
     "AT+CGMR",
 ];
 
+const SMS_STATE: &[&str] =
+    &["AT+CPMS=?", "AT+CPMS?", "AT+CNMI?", "AT+CMGF?", "AT+CSCA?", "AT+CSMS?"];
+/// `AT+CMGS` waits for the network: the manual allows up to 120 s.
+const SEND_TIMEOUT: Duration = Duration::from_secs(120);
+const SHORT_TEXT: &str = "dynatac test: short GSM text";
+/// Two UCS2 parts (> 70 UTF-16 units, non-GSM characters).
+const LONG_TEXT: &str =
+    "dynatac test: ünïcödé ☎ 👋 — long enough to need two parts as UCS2, which allows only 67 units per part with a header.";
+
 const HELP: &[&str] = &[
     "i init  c call  a answer",
     "h hangup  l list  t type",
     "m marker  ? help",
     "n pwr-on  o pwr-off  x hard-cut",
+    "s sms-state  p pdu  k cnmi",
+    "g list-sms  w send  u send-long",
 ];
 
 type Pwr = PinDriver<'static, AnyOutputPin, Output>;
@@ -141,39 +157,81 @@ enum Entry {
     Number,
     Command,
     Marker,
+    /// Destination for a test SMS with this text.
+    Sms(&'static str),
+}
+
+/// A queued command, with the payload to write at its `> ` prompt.
+struct Queued {
+    cmd: String,
+    payload: Option<Vec<u8>>,
+    timeout: Duration,
+}
+
+struct InFlight {
+    cmd: String,
+    payload: Option<Vec<u8>>,
+    timeout: Duration,
+    sent: Instant,
 }
 
 /// Commands waiting to be sent, one in flight at a time.
 struct Sender {
     tx: UartTxDriver<'static>,
-    queue: VecDeque<String>,
-    in_flight: Option<(String, Instant)>,
+    queue: VecDeque<Queued>,
+    in_flight: Option<InFlight>,
 }
 
 impl Sender {
     fn enqueue(&mut self, cmd: &str) {
-        self.queue.push_back(cmd.to_string());
+        self.queue.push_back(Queued { cmd: cmd.to_string(), payload: None, timeout: COMMAND_TIMEOUT });
+    }
+
+    /// A command that prompts (`AT+CMGS`): `payload` and Ctrl-Z follow the prompt.
+    fn enqueue_with_payload(&mut self, cmd: &str, payload: &str, timeout: Duration) {
+        let mut p = payload.as_bytes().to_vec();
+        p.push(0x1A);
+        self.queue.push_back(Queued { cmd: cmd.to_string(), payload: Some(p), timeout });
+    }
+
+    fn write(&mut self, bytes: &[u8], start: Instant) {
+        emit(start, Direction::Tx, bytes);
+        if let Err(e) = write_all(&mut self.tx, bytes) {
+            note(start, &format!("tx error: {:?}", e));
+        }
     }
 
     /// Send the next queued command if none is in flight. Returns the
     /// command sent, for display.
     fn pump(&mut self, start: Instant) -> Option<String> {
-        if let Some((cmd, sent)) = &self.in_flight {
-            if sent.elapsed() < COMMAND_TIMEOUT {
+        if let Some(f) = &self.in_flight {
+            if f.sent.elapsed() < f.timeout {
                 return None;
             }
-            note(start, &format!("timeout: {}", cmd));
+            note(start, &format!("timeout: {}", f.cmd));
             self.in_flight = None;
         }
-        let cmd = self.queue.pop_front()?;
-        let mut bytes = cmd.clone().into_bytes();
+        let q = self.queue.pop_front()?;
+        let mut bytes = q.cmd.clone().into_bytes();
         bytes.push(b'\r');
-        emit(start, Direction::Tx, &bytes);
-        if let Err(e) = write_all(&mut self.tx, &bytes) {
-            note(start, &format!("tx error: {:?}", e));
+        self.write(&bytes, start);
+        self.in_flight = Some(InFlight { cmd: q.cmd.clone(), payload: q.payload, timeout: q.timeout, sent: Instant::now() });
+        Some(q.cmd)
+    }
+
+    /// The modem's `> ` prompt: write the in-flight command's payload, or
+    /// cancel with ESC if it has none. Returns whether a payload went out.
+    fn prompt(&mut self, start: Instant) -> bool {
+        match self.in_flight.as_mut().and_then(|f| f.payload.take()) {
+            Some(p) => {
+                self.write(&p, start);
+                true
+            }
+            None => {
+                self.write(&[0x1B], start);
+                false
+            }
         }
-        self.in_flight = Some((cmd.clone(), Instant::now()));
-        Some(cmd)
     }
 
     /// A final result code arrived: the in-flight command is done.
@@ -345,7 +403,10 @@ fn main() {
                         }
                         term.push_output(&format!("< {}", line));
                     }
-                    AtEvent::Prompt => term.push_output("< > (prompt)"),
+                    AtEvent::Prompt => {
+                        let sent = sender.prompt(start);
+                        term.push_output(if sent { "< > (payload sent)" } else { "< > (ESC: no payload)" });
+                    }
                 }
                 dirty = true;
             }
@@ -386,6 +447,12 @@ fn main() {
                     KeyEvent::Char('c') => begin(&mut entry, Entry::Number, "number:", &mut term),
                     KeyEvent::Char('t') => begin(&mut entry, Entry::Command, "command:", &mut term),
                     KeyEvent::Char('m') => begin(&mut entry, Entry::Marker, "marker:", &mut term),
+                    KeyEvent::Char('s') => SMS_STATE.iter().for_each(|c| sender.enqueue(c)),
+                    KeyEvent::Char('p') => sender.enqueue("AT+CMGF=0"),
+                    KeyEvent::Char('k') => sender.enqueue("AT+CNMI=2,1,0,0,0"),
+                    KeyEvent::Char('g') => sender.enqueue("AT+CMGL=4"),
+                    KeyEvent::Char('w') => begin(&mut entry, Entry::Sms(SHORT_TEXT), "sms to:", &mut term),
+                    KeyEvent::Char('u') => begin(&mut entry, Entry::Sms(LONG_TEXT), "sms to:", &mut term),
                     KeyEvent::Char('n') => {
                         sender.reset();
                         term.push_output("# power-on pulse");
@@ -512,6 +579,16 @@ fn submit(kind: Entry, text: &str, sender: &mut Sender, term: &mut Terminal, sta
         }
         Entry::Command if !text.is_empty() => sender.enqueue(text),
         Entry::Command => {}
+        Entry::Sms(body) => match sms_pdu::encode_submit(text, body, 1) {
+            Ok(parts) => {
+                // PDU mode first: the PDU is meaningless in text mode.
+                sender.enqueue("AT+CMGF=0");
+                for p in parts {
+                    sender.enqueue_with_payload(&format!("AT+CMGS={}", p.tpdu_len), &p.hex, SEND_TIMEOUT);
+                }
+            }
+            Err(e) => term.push_output(&format!("cannot encode: {:?}", e)),
+        },
         Entry::Marker => {
             note(start, &format!("mark: {}", text));
             term.push_output(&format!("# mark: {}", text));

@@ -24,6 +24,8 @@
 //!     modem is powered off.
 
 pub mod at;
+pub mod gsm7;
+pub mod call_manager;
 pub mod driver;
 /// Fault testing of L0 → L2 against the simulator: test builds only.
 #[cfg(test)]
@@ -34,6 +36,7 @@ pub mod port;
 pub mod power;
 pub mod request;
 pub mod service;
+pub mod sms_pdu;
 /// Byte-level A7682E simulator: test builds only.
 #[cfg(test)]
 pub(crate) mod sim;

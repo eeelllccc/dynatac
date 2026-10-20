@@ -37,6 +37,16 @@ One scenario per file. Have a second phone ready.
 | `10-soft-power-cycle` | `m off` → `o` → wait 10 s → `m on` → `n` → wait 30 s → `i`. |
 | `11-hard-power-cut` | `m cut` → `x` → wait 30 s → `i`. |
 | `12-command-during-urc` | Start a call as in 03 → press `l` repeatedly (5–10×) around the moment the other side answers and again when they hang up. Shows whether URCs land inside replies. |
+| `13-sms-state` | Boot, wait 30 s → `i` → `m state` → `s` → `m pdu list` → `p` → `g`. Shows the SMS settings as stored (`CNMI`/`CPMS` are `AUTO_SAVE`) and whether the text from `09` was stored silently. |
+| `14-sms-receive-idle` | `i` → `p` → `m defaults` → text the device **`dynatac in 1`** → wait 15 s → `m cnmi` → `k` → `s` → text **`dynatac in 2`** → wait 15 s → `m long` → text a message of 200+ characters containing an emoji → wait 20 s → `g`. |
+| `15-sms-receive-in-call` | `i` → `p` → `k` → start a call as in 03 → `m sms` → text **`dynatac in call`** → wait 15 s → `m hangup` → `h` → wait 15 s → `g`. |
+| `16-sms-send` | `i` → `m short` → `w` + the other phone's number → wait 30 s → `m long` → `u` + the same number → wait 30 s → `g` → `m delete` → `t` `AT+CMGD=<index of the first message listed>` → `g`. |
+
+SMS keys: `s` reads the SMS settings, `p` selects PDU mode (`AT+CMGF=0`), `k` turns on
+new-message indications (`AT+CNMI=2,1,0,0,0`), `g` lists every stored message (`AT+CMGL=4`),
+`w` / `u` send a short GSM-alphabet text / a two-part UCS2 text (PDUs from
+`core/src/modem/sms_pdu.rs`, written at the `> ` prompt). Use only the texts given above
+(they end up in the fixtures); the scrub replaces the phone number in PDUs too.
 
 ## Findings so far
 
@@ -102,7 +112,7 @@ traces; "t+" is relative to the triggering event.
 - No `+CMTI`, no RI pulse, nothing, even 17 s after hang-up. `AT+CNMI` is `AUTO_SAVE`, so
   its current value is unknown (manual default `2,1,0,0,0`). Next: check `AT+CNMI?`,
   `AT+CPMS?` and `AT+CMGL="ALL"` to see whether the text was stored silently, then repeat
-  with `AT+CNMI=2,1` set explicitly.
+  with `AT+CNMI=2,1` set explicitly. Scenarios `13`–`16`.
 
 ### Concurrency (`12`)
 - 30+ back-to-back `AT+CLCC`s around connect and hang-up: replies were always
