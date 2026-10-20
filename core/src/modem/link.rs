@@ -60,7 +60,7 @@ const CTRL_Z: u8 = 0x1A;
 const ESC: u8 = 0x1B;
 
 /// Which received lines are a command's own info lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum Info {
     /// The reply has no info lines (`ATE0`, `AT+CHUP` …).
     None,
@@ -68,18 +68,22 @@ pub enum Info {
     /// prefix arriving during the command is taken as an info line; both
     /// describe the same current state.
     Prefixes(&'static [&'static str]),
+    /// Lines for which the predicate holds. For replies that share a
+    /// prefix with an unrelated URC: `AT+CLIP?` → `+CLIP: 1,1` versus the
+    /// caller-ID URC `+CLIP: "07700900123",129`.
+    Matching(fn(&str) -> bool),
     /// Any line that is not a recognised URC (`ATI`, SMS bodies …).
     AnyLine,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ReplySpec {
     pub info: Info,
     /// Final codes besides the standard ones, e.g. `NO CARRIER` for `ATA`.
     pub extra_finals: &'static [&'static str],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Command {
     /// Without the trailing `\r`.
     pub text: String,
@@ -213,16 +217,21 @@ impl Engine {
     /// recognises URC lines (needed to tell them from `Info::AnyLine`
     /// reply lines).
     pub fn new(is_urc: fn(&str) -> bool, now: Millis) -> Self {
-        let mut e = Self {
+        let mut e = Self::off(is_urc);
+        e.start_probe(now);
+        e
+    }
+
+    /// A new engine for an unpowered modem: writes nothing until `reset`.
+    pub fn off(is_urc: fn(&str) -> bool) -> Self {
+        Self {
             state: State::Off,
             parser: AtParser::new(),
             queue: VecDeque::new(),
             out: VecDeque::new(),
             next_id: 0,
             is_urc,
-        };
-        e.start_probe(now);
-        e
+        }
     }
 
     /// Queue a command. Its reply comes later as exactly one `Output::Reply`
@@ -423,6 +432,7 @@ impl Engine {
                 let own = match f.cmd.spec.info {
                     Info::None => false,
                     Info::Prefixes(ps) => ps.iter().any(|p| line.starts_with(p)),
+                    Info::Matching(f) => f(&line),
                     Info::AnyLine => !is_urc(&line),
                 };
                 if own {
@@ -653,6 +663,31 @@ mod tests {
             r.take(),
             [write("ATI\r"), urc("RING"), reply(id, Outcome::Ok, &["Model: A7682E", "+GCAP: +DS"])]
         );
+    }
+
+    #[test]
+    fn info_lines_by_predicate_leave_same_prefix_urcs_alone() {
+        fn clip_setting(l: &str) -> bool {
+            l.strip_prefix("+CLIP: ").is_some_and(|r| r.split(',').all(|f| f.parse::<u8>().is_ok()))
+        }
+        let spec = ReplySpec { info: Info::Matching(clip_setting), extra_finals: &[] };
+        let mut r = Rig::synced();
+        let id = r.submit(cmd("AT+CLIP?", spec));
+        r.rx("\r\n+CLIP: \"07700900123\",129\r\n\r\n+CLIP: 1,1\r\n\r\nOK\r\n");
+        assert_eq!(
+            r.take(),
+            [write("AT+CLIP?\r"), urc("+CLIP: \"07700900123\",129"), reply(id, Outcome::Ok, &["+CLIP: 1,1"])]
+        );
+    }
+
+    #[test]
+    fn off_engine_writes_nothing_until_reset() {
+        let mut e = Engine::off(is_urc);
+        assert_eq!(e.poll(), None);
+        assert_eq!(e.next_deadline(), None);
+        e.reset(0);
+        assert_eq!(e.poll(), Some(ev(LinkEvent::Unsynced(UnsyncReason::Reset))));
+        assert_eq!(e.poll(), Some(write("AT\r")));
     }
 
     #[test]

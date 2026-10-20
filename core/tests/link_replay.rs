@@ -11,7 +11,9 @@
 use dynatac_core::modem::link::{
     Command, Engine, Failure, Info, LinkEvent, Outcome, Output, ReplySpec, QUIET_MS,
 };
+use dynatac_core::modem::request::{Gain, PhoneNumber, Request};
 use dynatac_core::modem::trace::{parse_trace, timeline, Direction, Step};
+use dynatac_core::modem::unsolicited::is_urc;
 use dynatac_core::modem::transport::Rx;
 
 macro_rules! fixture {
@@ -38,27 +40,29 @@ const ALL: &[(&str, &str)] = &[
 
 const NONE: ReplySpec = ReplySpec { info: Info::None, extra_finals: &[] };
 
-fn is_urc(line: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "RING", "NO CARRIER", "+CLCC:", "+CLIP:", "+COLP:", "VOICE CALL:", "+CGEV:", "*ATREADY:",
-        "+CPIN:", "SMS DONE", "PB DONE", "+CMTI:",
-    ];
-    PREFIXES.iter().any(|p| line.starts_with(p))
-}
-
-/// The reply format of every command in the captures (L2 will own these).
+/// The L2 request behind each captured command, so the replay checks the
+/// real reply specs. `AT+CLCC=1` has no request (the HAL doesn't send it:
+/// this firmware answers `ERROR`), so it gets a plain spec.
 fn spec(text: &str) -> ReplySpec {
-    match text {
-        "AT+CLCC" => ReplySpec { info: Info::Prefixes(&["+CLCC:"]), extra_finals: &[] },
-        "AT+CGMR" => ReplySpec { info: Info::Prefixes(&["+CGMR:"]), extra_finals: &[] },
-        "ATI" => ReplySpec { info: Info::AnyLine, extra_finals: &[] },
-        "ATA" => ReplySpec { info: Info::None, extra_finals: &["NO CARRIER"] },
-        t if t.starts_with("ATD") => ReplySpec {
-            info: Info::None,
-            extra_finals: &["BUSY", "NO ANSWER", "NO CARRIER", "NO DIALTONE"],
-        },
-        _ => NONE,
-    }
+    let request = match text {
+        "ATE0" => Request::EchoOff,
+        "AT+CMEE=2" => Request::SetVerboseErrors,
+        "AT+CVHU=0" => Request::SetVoiceHangUp,
+        "AT+CLIP=1" => Request::SetCallerId,
+        "AT+COUTGAIN=7" => Request::SetOutputGain(Gain::MAX),
+        "ATI" => Request::Identify,
+        "AT+CGMR" => Request::Firmware,
+        "ATA" => Request::Answer,
+        "AT+CHUP" => Request::HangUp,
+        "AT+CLCC" => Request::ListCalls,
+        "AT+CLCC=1" => return NONE,
+        t => Request::Dial(
+            PhoneNumber::parse(t.strip_prefix("ATD").and_then(|n| n.strip_suffix(';')).expect(t)).unwrap(),
+        ),
+    };
+    let cmd = request.command();
+    assert_eq!(cmd.text, text);
+    cmd.spec
 }
 
 /// Engine time = trace time + this, leaving room to sync first.
@@ -183,4 +187,14 @@ fn call_state_urcs_inside_the_answer_reply_stay_urcs() {
         log[reply - 3..reply],
         ["urc +CGEV: NW ACT 8,10", "urc VOICE CALL: BEGIN", "urc +CLCC: 1,1,0,0,0,\"07700900123\",129,\"\""]
     );
+}
+
+/// Every URC the real modem sent in the captures is one L2 recognises.
+#[test]
+fn every_captured_urc_is_recognised() {
+    for (name, text) in ALL {
+        for u in replay(text).urcs {
+            assert!(is_urc(&u), "{name}: unrecognised URC {u:?}");
+        }
+    }
 }

@@ -24,8 +24,11 @@
 //!     modem is powered off.
 
 pub mod at;
+pub mod hal;
 pub mod link;
+pub mod request;
 pub mod trace;
+pub mod unsolicited;
 pub mod transport;
 
 pub use at::{classify, AtEvent, AtParser, LineClass, Urc};
