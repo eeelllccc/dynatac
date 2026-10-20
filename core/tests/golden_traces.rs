@@ -9,6 +9,7 @@
 //! Fixture conventions: the dialled number is `07700900123`. Notes are
 //! capture-tool events (`pwrkey on-pulse end`, `ri low`, `mark: …`).
 
+use dynatac_core::modem::sms_pdu::{self, Body, Concat, Pdu};
 use dynatac_core::modem::trace::{parse_trace, timeline, Step, TimedStep};
 
 macro_rules! fixture {
@@ -31,6 +32,9 @@ const ALL: &[(&str, &str)] = &[
     fixture!("10-soft-power-cycle"),
     fixture!("11-hard-power-cut"),
     fixture!("12-command-during-urc"),
+    fixture!("14-sms-receive-idle"),
+    fixture!("15-sms-receive-in-call"),
+    fixture!("16-sms-send"),
 ];
 
 const DIAL: &str = "ATD07700900123;";
@@ -48,12 +52,21 @@ fn is_final(line: &str) -> bool {
 
 /// Every reply to `cmd`: the lines after each send of it, up to and
 /// including `OK` / `ERROR` / `+CME|CMS ERROR`. Includes any URCs that
-/// arrived in between — that is the point of several tests.
+/// arrived in between — that is the point of several tests. A `> ` prompt
+/// and the payload written at it appear as the lines `"> "` and `"<payload>"`.
 fn replies(steps: &[TimedStep], cmd: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut current: Option<Vec<String>> = None;
     for s in steps {
         match &s.step {
+            Step::Prompt => {
+                if let Some(lines) = current.as_mut() {
+                    lines.push("> ".into());
+                }
+            }
+            Step::Sent(_) if current.as_ref().is_some_and(|l| l.last().is_some_and(|l| l == "> ")) => {
+                current.as_mut().unwrap().push("<payload>".into());
+            }
             Step::Sent(c) => {
                 assert!(current.is_none(), "{cmd}: sent {c} before the final code");
                 if c == cmd {
@@ -457,5 +470,231 @@ fn call_list_replies_contain_only_call_lines() {
         let (last, info) = r.split_last().unwrap();
         assert_eq!(last, "OK");
         assert!(info.iter().all(|l| l.starts_with("+CLCC: ")), "{r:?}");
+    }
+}
+
+// --- SMS ----------------------------------------------------------------------
+
+/// Captures 14–16 run in sequence on an emptied SIM (texts typed on a phone,
+/// which capitalised them): 14 receives five
+/// messages (two single texts and a three-part UCS2 text), 15 a sixth during
+/// a call, and 16 sends two texts, reads message 1 and deletes it.
+const SMS: &[&str] = &["14-sms-receive-idle", "15-sms-receive-in-call", "16-sms-send"];
+
+/// The texts `device/examples/modem_capture.rs` sends (keys `w` and `u`).
+const SHORT_TEXT: &str = "dynatac test: short GSM text";
+const LONG_TEXT: &str =
+    "dynatac test: ünïcödé ☎ 👋 — long enough to need two parts as UCS2, which allows only 67 units per part with a header.";
+
+/// One stored message from a `+CMGL` / `+CMGR` reply.
+#[derive(Debug)]
+struct Stored {
+    index: Option<u8>,
+    stat: u8,
+    tpdu_len: usize,
+    hex: String,
+}
+
+/// `+CMGL: <index>,<stat>,,<length>` (the alpha field empty, unquoted) or
+/// `+CMGR: <stat>,"",<length>` (quoted), each followed by one hex line.
+fn stored(reply: &[String]) -> Vec<Stored> {
+    let mut out = Vec::new();
+    let mut it = reply.iter();
+    while let Some(line) = it.next() {
+        let (index, fields) = if let Some(rest) = line.strip_prefix("+CMGL: ") {
+            let f: Vec<_> = rest.split(',').collect();
+            assert_eq!(f.len(), 4, "{line}");
+            assert_eq!(f[2], "", "{line}");
+            (Some(f[0].parse().unwrap()), (f[1], f[3]))
+        } else if let Some(rest) = line.strip_prefix("+CMGR: ") {
+            let f: Vec<_> = rest.split(',').collect();
+            assert_eq!(f.len(), 3, "{line}");
+            assert_eq!(f[1], "\"\"", "{line}");
+            (None, (f[0], f[2]))
+        } else {
+            continue;
+        };
+        let hex = it.next().expect("PDU line").clone();
+        assert!(sms_pdu::is_hex_line(&hex), "{hex}");
+        out.push(Stored { index, stat: fields.0.parse().unwrap(), tpdu_len: fields.1.parse().unwrap(), hex });
+    }
+    out
+}
+
+fn listings(name: &str) -> Vec<Vec<Stored>> {
+    replies(&load(name), "AT+CMGL=4").iter().map(|r| stored(r)).collect()
+}
+
+fn delivered(s: &Stored) -> sms_pdu::Deliver {
+    match sms_pdu::decode(&s.hex) {
+        Ok(Pdu::Deliver(d)) => d,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn text(body: &Body) -> &str {
+    match body {
+        Body::Text(t) => t,
+        Body::Data(d) => panic!("data {d:?}"),
+    }
+}
+
+fn cmti_lines(steps: &[TimedStep]) -> Vec<(u64, String)> {
+    lines(steps).into_iter().filter(|(_, l)| l.starts_with("+CMTI: ")).collect()
+}
+
+/// `AT+CMGF` is not saved (13: text mode at boot), so PDU mode is set after
+/// every boot; it is accepted with a plain `OK`.
+#[test]
+fn pdu_mode_is_accepted() {
+    for name in SMS {
+        assert_eq!(reply(&load(name), "AT+CMGF=0"), ["OK"], "{name}");
+    }
+}
+
+/// Each new message is announced as `+CMTI: "SM",<index>` (the SIM), at
+/// the end of a ~115 ms RI low pulse, idle or in a call. Indices count up
+/// from 1 on the emptied SIM, one per part of a multipart message.
+#[test]
+fn new_message_is_announced_after_an_ri_pulse() {
+    let mut indices = Vec::new();
+    for name in ["14-sms-receive-idle", "15-sms-receive-in-call"] {
+        let steps = load(name);
+        let pulses = ri_pulses(&steps);
+        for (t, line) in cmti_lines(&steps) {
+            indices.push(line.strip_prefix("+CMTI: \"SM\",").expect(&line).parse::<u8>().unwrap());
+            let (lo, hi) = *pulses.iter().find(|(lo, _)| *lo < t && t - lo < 200).expect("RI pulse before +CMTI");
+            assert!((100..=140).contains(&(hi - lo)), "{name}: RI low {} ms", hi - lo);
+            assert!(t.abs_diff(hi) <= 10, "{name}: +CMTI {t}, RI high {hi}");
+        }
+    }
+    assert_eq!(indices, [1, 2, 3, 4, 5, 6]);
+}
+
+/// A text arriving during a call is announced like any other and leaves
+/// the call alone: no call URC between `+CMTI` and the hang-up.
+#[test]
+fn message_during_a_call_is_announced_normally() {
+    let steps = load("15-sms-receive-in-call");
+    let sms = note_time(&steps, "mark: sms");
+    let hangup = note_time(&steps, "mark: hangup");
+    assert_eq!(lines_between(&steps, sms, hangup), ["+CMTI: \"SM\",6"]);
+}
+
+/// `AT+CMGD=1,4` (delete all) empties the SIM; `AT+CMGL=4` on an empty
+/// store is a bare `OK`.
+#[test]
+fn delete_all_empties_the_store() {
+    let steps = load("14-sms-receive-idle");
+    assert_eq!(reply(&steps, "AT+CMGD=1,4"), ["OK"]);
+    assert_eq!(reply(&steps, "AT+CMGL=4"), ["OK"]);
+}
+
+/// Every listed PDU decodes, and `<length>` is the TPDU length: the octets
+/// after the SMSC address.
+#[test]
+fn listed_pdus_decode_and_lengths_exclude_the_smsc() {
+    let mut n = 0;
+    for name in SMS {
+        for s in listings(name).iter().flatten() {
+            let sca_octets = usize::from_str_radix(&s.hex[..2], 16).unwrap();
+            assert_eq!(s.hex.len() / 2 - 1 - sca_octets, s.tpdu_len, "{name} {s:?}");
+            assert_eq!(delivered(s).from, "+447700900123", "{name}");
+            n += 1;
+        }
+    }
+    assert_eq!(n, 5 + 6 + 6 + 5);
+}
+
+/// Listing reports unread messages (stat 0) as unread and then marks them
+/// read (stat 1): the modem's read flag can't be the store's truth.
+#[test]
+fn listing_marks_messages_read() {
+    let stats = |name| -> Vec<Vec<(u8, u8)>> {
+        listings(name).iter().map(|l| l.iter().map(|s| (s.index.unwrap(), s.stat)).collect()).collect()
+    };
+    assert_eq!(stats("14-sms-receive-idle")[1], [(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]);
+    assert_eq!(stats("15-sms-receive-in-call")[0], [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 0)]);
+}
+
+/// The parts of a multipart text are stored as they arrive, which need not
+/// be in order: here 1, 3, 2. Reassembly goes by the concatenation header.
+#[test]
+fn multipart_parts_can_be_stored_out_of_order() {
+    let listing = &listings("14-sms-receive-idle")[1];
+    let texts: Vec<_> = listing[..2].iter().map(|s| text(&delivered(s).body).to_string()).collect();
+    assert_eq!(texts, ["Dynatac in 1", "Dynatac in 2"]);
+    let parts: Vec<_> = listing[2..].iter().map(delivered).collect();
+    let seqs: Vec<_> = parts.iter().map(|d| d.concat.expect("concatenated").seq).collect();
+    assert_eq!(seqs, [1, 3, 2]);
+    let reference = parts[0].concat.unwrap().reference;
+    for d in &parts {
+        assert_eq!(d.concat, Some(Concat { reference, total: 3, seq: d.concat.unwrap().seq }));
+    }
+    let mut ordered: Vec<_> = parts.iter().collect();
+    ordered.sort_by_key(|d| d.concat.unwrap().seq);
+    let joined: String = ordered.iter().map(|d| text(&d.body)).collect();
+    assert_eq!(
+        joined,
+        "The only way you could be sure is if the government has the money and you have a plan for the \
+         next one and then the government can take it and make sure you get the right one for the right \
+         price ✅✅✅"
+    );
+}
+
+/// `AT+CMGR=<index>`: `+CMGR: <stat>,"",<length>`, the PDU, `OK`. Reading
+/// doesn't remove it; `AT+CMGD=<index>` does, leaving the rest in place.
+#[test]
+fn read_one_and_delete_one() {
+    let steps = load("16-sms-send");
+    let read = stored(&reply(&steps, "AT+CMGR=1"));
+    assert_eq!(read.len(), 1);
+    assert_eq!((read[0].index, read[0].stat, read[0].tpdu_len), (None, 1, 30));
+    assert_eq!(text(&delivered(&read[0]).body), "Dynatac in 1");
+    assert_eq!(reply(&steps, "AT+CMGR=1").last().unwrap(), "OK");
+    assert_eq!(reply(&steps, "AT+CMGD=1"), ["OK"]);
+    let [before, after] = &listings("16-sms-send")[..] else { panic!("two listings") };
+    assert_eq!(before[0].hex, read[0].hex);
+    let idx = |l: &[Stored]| l.iter().map(|s| s.index.unwrap()).collect::<Vec<_>>();
+    assert_eq!(idx(before), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(idx(after), [2, 3, 4, 5, 6]);
+}
+
+/// Sending: `AT+CMGS=<tpdu length>` → `> ` prompt within ~25 ms → PDU +
+/// Ctrl-Z → `+CMGS: <message reference>` and `OK` ~1–1.5 s later. The
+/// PDUs sent are exactly what `encode_submit` produces, one `CMGS` per part.
+#[test]
+fn send_prompts_then_reports_the_message_reference() {
+    let steps = load("16-sms-send");
+    let mut sent = Vec::new();
+    let mut refs = Vec::new();
+    for pdu in [SHORT_TEXT, LONG_TEXT].iter().flat_map(|t| sms_pdu::encode_submit("07700900123", t, 1).unwrap()) {
+        let cmd = format!("AT+CMGS={}", pdu.tpdu_len);
+        let r = reply(&steps, &cmd);
+        let [prompt, payload, mr, ok] = &r[..] else { panic!("{cmd}: {r:?}") };
+        assert_eq!((prompt.as_str(), payload.as_str(), ok.as_str()), ("> ", "<payload>", "OK"));
+        refs.push(mr.strip_prefix("+CMGS: ").expect(mr).parse::<u8>().unwrap());
+        sent.push(format!("{}\x1A", pdu.hex));
+    }
+    let written: Vec<_> = steps
+        .iter()
+        .filter_map(|s| match &s.step {
+            Step::Sent(c) if c.ends_with('\x1A') => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written, sent);
+    // The reference counts up per part sent.
+    assert_eq!(refs.windows(2).filter(|w| w[1] != w[0] + 1).count(), 0, "{refs:?}");
+
+    for (i, s) in steps.iter().enumerate() {
+        if matches!(&s.step, Step::Sent(c) if c.starts_with("AT+CMGS=")) {
+            let prompt = steps[i..].iter().find(|s| s.step == Step::Prompt).unwrap();
+            assert!(prompt.t_ms - s.t_ms <= 50, "prompt after {} ms", prompt.t_ms - s.t_ms);
+            let payload = &steps[i + 2];
+            assert!(matches!(&payload.step, Step::Sent(_)));
+            let mr = steps[i..].iter().find(|s| matches!(&s.step, Step::Line(l) if l.starts_with("+CMGS: "))).unwrap();
+            assert!((500..=2000).contains(&(mr.t_ms - payload.t_ms)), "+CMGS after {} ms", mr.t_ms - payload.t_ms);
+        }
     }
 }

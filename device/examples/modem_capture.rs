@@ -27,6 +27,7 @@
 //!   s  SMS state (read only): CPMS=?, CPMS?, CNMI?, CMGF?, CSCA?, CSMS?
 //!   p  PDU mode (AT+CMGF=0)   k  new-SMS indication (AT+CNMI=2,1,0,0,0)
 //!   g  list all stored SMS (AT+CMGL=4, PDU mode)
+//!   d  network / SMS-domain diagnostics (read only; unsupported ones answer ERROR)
 //!   w  send a short GSM text  u  send a 2-part UCS2 text (to a number entered)
 //!   ?  show this help
 //! In text entry: Enter submits, Alt+Backspace cancels.
@@ -86,6 +87,13 @@ const INIT_COMMANDS: &[&str] = &[
 
 const SMS_STATE: &[&str] =
     &["AT+CPMS=?", "AT+CPMS?", "AT+CNMI?", "AT+CMGF?", "AT+CSCA?", "AT+CSMS?"];
+/// Why might texts reach the modem only at attach? Registration per domain,
+/// operator and RAT, signal, network mode, UE mode (CS/PS: SMS over SGs),
+/// IMS registration (SMS over IMS), SMS service preference.
+const NET_DIAG: &[&str] = &[
+    "AT+CREG?", "AT+CEREG?", "AT+CGREG?", "AT+COPS?", "AT+CPSI?", "AT+CSQ", "AT+CNMP?",
+    "AT+CEMODE?", "AT+CIREG?", "AT+CGSMS?",
+];
 /// `AT+CMGS` waits for the network: the manual allows up to 120 s.
 const SEND_TIMEOUT: Duration = Duration::from_secs(120);
 const SHORT_TEXT: &str = "dynatac test: short GSM text";
@@ -100,6 +108,8 @@ const HELP: &[&str] = &[
     "n pwr-on  o pwr-off  x hard-cut",
     "s sms-state  p pdu  k cnmi",
     "g list-sms  w send  u send-long",
+    "d net-diag  v read-sms-1",
+    "r delete-sms-1  e erase-all-sms",
 ];
 
 type Pwr = PinDriver<'static, AnyOutputPin, Output>;
@@ -451,6 +461,10 @@ fn main() {
                     KeyEvent::Char('p') => sender.enqueue("AT+CMGF=0"),
                     KeyEvent::Char('k') => sender.enqueue("AT+CNMI=2,1,0,0,0"),
                     KeyEvent::Char('g') => sender.enqueue("AT+CMGL=4"),
+                    KeyEvent::Char('v') => sender.enqueue("AT+CMGR=1"),
+                    KeyEvent::Char('r') => sender.enqueue("AT+CMGD=1"),
+                    KeyEvent::Char('e') => sender.enqueue("AT+CMGD=1,4"),
+                    KeyEvent::Char('d') => NET_DIAG.iter().for_each(|c| sender.enqueue(c)),
                     KeyEvent::Char('w') => begin(&mut entry, Entry::Sms(SHORT_TEXT), "sms to:", &mut term),
                     KeyEvent::Char('u') => begin(&mut entry, Entry::Sms(LONG_TEXT), "sms to:", &mut term),
                     KeyEvent::Char('n') => {

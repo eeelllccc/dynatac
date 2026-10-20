@@ -46,7 +46,13 @@ FIXTURES=(
   "10-soft-power-cycle:10-soft-power-cycle"
   "11-hard-power-cut:11-hard-power-cut"
   "12-command-during-urc:12-command-during-urc"
+  "14-sms-receive-idle:14-sms-receive-idle"
+  "15-sms-receive-in-call:15-sms-receive-in-call"
+  "16-sms-send:16-sms-send"
 )
+# Not fixtures: 13-sms-state and the first runs of 14 (14-sms-received-idle,
+# 14b-sms-delivery-check) list messages from other people. Their findings
+# are in captures/README.md.
 
 for pair in "${FIXTURES[@]}"; do
   src="captures/${pair%%:*}.log"

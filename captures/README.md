@@ -38,15 +38,19 @@ One scenario per file. Have a second phone ready.
 | `11-hard-power-cut` | `m cut` → `x` → wait 30 s → `i`. |
 | `12-command-during-urc` | Start a call as in 03 → press `l` repeatedly (5–10×) around the moment the other side answers and again when they hang up. Shows whether URCs land inside replies. |
 | `13-sms-state` | Boot, wait 30 s → `i` → `m state` → `s` → `m pdu list` → `p` → `g`. Shows the SMS settings as stored (`CNMI`/`CPMS` are `AUTO_SAVE`) and whether the text from `09` was stored silently. |
-| `14-sms-receive-idle` | `i` → `p` → `m defaults` → text the device **`dynatac in 1`** → wait 15 s → `m cnmi` → `k` → `s` → text **`dynatac in 2`** → wait 15 s → `m long` → text a message of 200+ characters containing an emoji → wait 20 s → `g`. |
-| `15-sms-receive-in-call` | `i` → `p` → `k` → start a call as in 03 → `m sms` → text **`dynatac in call`** → wait 15 s → `m hangup` → `h` → wait 15 s → `g`. |
-| `16-sms-send` | `i` → `m short` → `w` + the other phone's number → wait 30 s → `m long` → `u` + the same number → wait 30 s → `g` → `m delete` → `t` `AT+CMGD=<index of the first message listed>` → `g`. |
+| `14-sms-receive-idle` | `i` → `p` → `m clear` → `e` (empty the SIM) → `g` → `m text 1` → text the device **`dynatac in 1`** → wait 15 s → `m text 2` → text **`dynatac in 2`** → wait 15 s → `m long` → text a made-up message of 200+ characters containing an emoji → wait 30 s → `g`. |
+| `15-sms-receive-in-call` | `i` → `p` → start a call as in 03 → `m sms` → text **`dynatac in call`** → wait 15 s → `m hangup` → `h` → wait 15 s → `g`. |
+| `16-sms-send` | `i` → `m short` → `w` + the other phone's number → wait 30 s → `m long` → `u` + the same number → wait 30 s → `g` → `m read` → `v` → `m delete` → `r` → `g`. |
 
 SMS keys: `s` reads the SMS settings, `p` selects PDU mode (`AT+CMGF=0`), `k` turns on
 new-message indications (`AT+CNMI=2,1,0,0,0`), `g` lists every stored message (`AT+CMGL=4`),
-`w` / `u` send a short GSM-alphabet text / a two-part UCS2 text (PDUs from
+`d` reads registration / network-mode / IMS diagnostics, `v` reads message 1 (`AT+CMGR=1`),
+`r` deletes message 1 (`AT+CMGD=1`), `e` deletes every stored message (`AT+CMGD=1,4`), `w` / `u` send a short GSM-alphabet text / a two-part UCS2 text (PDUs from
 `core/src/modem/sms_pdu.rs`, written at the `> ` prompt). Use only the texts given above
 (they end up in the fixtures); the scrub replaces the phone number in PDUs too.
+
+**Send every text as plain SMS**: turn RCS chat off on the sending phone for the session
+(or long-press → resend as text). RCS messages never reach the modem.
 
 ## Findings so far
 
@@ -113,6 +117,36 @@ traces; "t+" is relative to the triggering event.
   its current value is unknown (manual default `2,1,0,0,0`). Next: check `AT+CNMI?`,
   `AT+CPMS?` and `AT+CMGL="ALL"` to see whether the text was stored silently, then repeat
   with `AT+CNMI=2,1` set explicitly. Scenarios `13`–`16`.
+
+### SMS state and storage (`13`, `14`)
+- Stored settings (`AUTO_SAVE`): `+CNMI: 2,1,0,0,0` (new SMS stored + `+CMTI` already on), `+CSMS: 0,1,1,1`,
+  `+CSCA: "+44…",145`. `+CMGF: 1` (text) at boot: **`CMGF` is not saved**, set `AT+CMGF=0` after every boot.
+- Storage: `+CPMS=?` offers `"ME"` and `"SM"`; in use `"SM"` for all three, **7 of 10 slots used**. The SIM
+  holds only 10 messages: the device must keep its own copy and delete from the SIM, or it fills up.
+- `+CMTI: "SM",<index>` with a ~115 ms RI low pulse just before it (`13`: two messages, 38 s after power-on).
+- `AT+CMGL=4` (PDU, all): `+CMGL: <index>,<stat>,,<tpdu length>` + one hex line per message, `OK` last. Long
+  lines arrive split across reads. **Listing marks unread messages read** (stat 0 → 1 between `13` and `14`),
+  so the modem's read flag can't be the store's truth.
+- All 7 stored PDUs (intl. and alphanumeric senders, 7-bit text, 8-bit WAP push) decode with
+  `core/src/modem/sms_pdu.rs`, and every `<tpdu length>` matches.
+- The texts in the first runs of `09` and `14` (and a since-dropped `14b`) never arrived because the sending
+  phone sent them as **RCS**, not SMS. Not a modem problem. `14` is redone with plain SMS; `15` supersedes `09`.
+  `14b`'s `d` diagnostics, for reference: `CREG`/`CEREG`/`CGREG` `0,1`, `+COPS: 0,2,"23430",7` (LTE),
+  `+CNMP: 2`, `+CEMODE: 2`, `+CIREG: 1,1,15` (IMS registered), `+CGSMS: 3`.
+- Messages 4 and 6 have `TP-PID 0x40` (Short Message Type 0: the receiver should acknowledge and discard
+  them). The store must drop these, not show them.
+- Privacy: these logs hold other people's numbers, message bodies and an MMS link. They need a PDU-aware
+  scrub (sender and body replaced, lengths kept) before becoming fixtures; not in `make-fixtures.sh` yet.
+
+### SMS receive and send (`14`–`16`, plain SMS)
+Pinned in `core/tests/golden_traces.rs` (SMS section).
+- `+CMTI: "SM",<index>` ~20 s after sending from the phone, idle or in a call (the call is unaffected), at the
+  end of a 100–140 ms RI low pulse. A 3-part UCS2 text arrived as three `+CMTI`s within 1.2 s and was stored
+  **out of order** (indices 3, 4, 5 = parts 1, 3, 2): reassemble by the concatenation header.
+- `AT+CMGR=<i>`: `+CMGR: <stat>,"",<len>` (alpha quoted, unlike `CMGL`), the PDU, `OK`. Doesn't delete.
+- `AT+CMGD=<i>` deletes one (others keep their indices); `AT+CMGD=1,4` deletes all; empty `CMGL` is bare `OK`.
+- `AT+CMGS=<len>` → `> ` in ~25 ms → PDU + Ctrl-Z → `+CMGS: <mr>` + `OK` in 0.9–1.4 s. The message
+  reference counts up per part (24, 25, 26). The sent PDUs are byte-for-byte `encode_submit`'s output.
 
 ### Concurrency (`12`)
 - 30+ back-to-back `AT+CLCC`s around connect and hang-up: replies were always
