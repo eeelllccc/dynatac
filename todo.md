@@ -1,6 +1,0 @@
-- sd card support
-- file system
-- contacts app
-- battery level?
-- power on power off, power button currently does a reset and reboot
-- programs should be transport layer agnostic, 

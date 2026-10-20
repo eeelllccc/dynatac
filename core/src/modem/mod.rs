@@ -24,6 +24,7 @@
 //!     modem is powered off.
 
 pub mod at;
+pub mod link;
 pub mod trace;
 pub mod transport;
 
