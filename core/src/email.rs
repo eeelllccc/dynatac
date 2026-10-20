@@ -6,7 +6,7 @@
 //!     `DATA` command
 //!   - [`SmtpStream`] — a minimal byte-oriented stream the device
 //!     implements with TLS, and that tests substitute with
-//!     [`MockSmtpStream`]
+//!     `tests::MockSmtpStream`
 //!   - [`base64_encode`] — used by AUTH LOGIN
 //!
 //! The actual SMTP protocol state machine lives in [`SmtpSession`]
@@ -20,7 +20,6 @@
 //!     with the CRLF stripped. Multi-line replies are read with
 //!     repeated calls.
 
-use std::collections::VecDeque;
 
 /// A plain-text email message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +71,7 @@ impl Email {
 /// Byte-level stream the SMTP session reads from and writes to.
 ///
 /// The device implementation wraps a TLS socket; tests use
-/// [`MockSmtpStream`] with scripted server responses.
+/// `tests::MockSmtpStream` with scripted server responses.
 pub trait SmtpStream {
     /// Read one CRLF-terminated server line. Returned string excludes the CRLF.
     fn read_line(&mut self) -> Result<String, String>;
@@ -80,105 +79,18 @@ pub trait SmtpStream {
     fn write_all(&mut self, data: &[u8]) -> Result<(), String>;
 }
 
-/// Test double: returns scripted server lines in order and records all
-/// bytes the client writes.
-pub struct MockSmtpStream {
-    server_lines: VecDeque<String>,
-    pub written: Vec<u8>,
-}
-
-impl MockSmtpStream {
-    pub fn new() -> Self {
-        Self {
-            server_lines: VecDeque::new(),
-            written: Vec::new(),
-        }
-    }
-
-    /// Queue a line the server will return on the next `read_line` call.
-    pub fn push_line(&mut self, line: &str) -> &mut Self {
-        self.server_lines.push_back(line.to_string());
-        self
-    }
-
-    /// Everything the client has written so far, as a UTF-8 string.
-    pub fn written_str(&self) -> String {
-        String::from_utf8_lossy(&self.written).into_owned()
-    }
-
-    /// True if every queued server line has been consumed.
-    pub fn is_drained(&self) -> bool {
-        self.server_lines.is_empty()
-    }
-}
-
-impl Default for MockSmtpStream {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SmtpStream for MockSmtpStream {
-    fn read_line(&mut self) -> Result<String, String> {
-        self.server_lines
-            .pop_front()
-            .ok_or_else(|| "mock: no more server lines".to_string())
-    }
-    fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
-        self.written.extend_from_slice(data);
-        Ok(())
-    }
-}
-
 // --- SmtpStreamFactory ------------------------------------------------------
 
 /// Opens SMTP streams on demand.
 ///
 /// Production code returns a fresh TLS-wrapped TCP connection per call;
-/// the mock returns a borrow of an internal scripted [`MockSmtpStream`]
+/// the mock returns a borrow of an internal scripted `tests::MockSmtpStream`
 /// the test can inspect afterward.
 ///
 /// Each `open` invalidates any previously-returned stream — callers must
 /// finish one session before opening another.
 pub trait SmtpStreamFactory {
     fn open(&mut self, host: &str, port: u16) -> Result<&mut dyn SmtpStream, String>;
-}
-
-/// Test double for [`SmtpStreamFactory`]. Owns a single [`MockSmtpStream`]
-/// the test pre-loads with server responses and inspects after the program
-/// has run.
-pub struct MockSmtpStreamFactory {
-    pub stream: MockSmtpStream,
-    pub open_count: usize,
-    /// If set, `open` returns this error instead of a stream. Used to test
-    /// the "couldn't connect" path.
-    pub fail_with: Option<String>,
-}
-
-impl MockSmtpStreamFactory {
-    pub fn new() -> Self {
-        Self {
-            stream: MockSmtpStream::new(),
-            open_count: 0,
-            fail_with: None,
-        }
-    }
-}
-
-impl Default for MockSmtpStreamFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SmtpStreamFactory for MockSmtpStreamFactory {
-    fn open(&mut self, _host: &str, _port: u16) -> Result<&mut dyn SmtpStream, String> {
-        self.open_count += 1;
-        if let Some(e) = &self.fail_with {
-            return Err(e.clone());
-        }
-        Ok(&mut self.stream)
-    }
 }
 
 // --- base64 -----------------------------------------------------------------
@@ -344,8 +256,9 @@ fn write_line(stream: &mut dyn SmtpStream, line: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     // --- Email serialization ---
 
@@ -692,5 +605,94 @@ mod tests {
         assert!(w.contains("\r\n..secret message\r\n"));
         // The terminator is still recognizable.
         assert!(w.contains("\r\nnormal\r\n.\r\n"));
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// Test double: returns scripted server lines in order and records all
+    /// bytes the client writes.
+    pub struct MockSmtpStream {
+        server_lines: VecDeque<String>,
+        pub written: Vec<u8>,
+    }
+
+    impl MockSmtpStream {
+        pub fn new() -> Self {
+            Self {
+                server_lines: VecDeque::new(),
+                written: Vec::new(),
+            }
+        }
+
+        /// Queue a line the server will return on the next `read_line` call.
+        pub fn push_line(&mut self, line: &str) -> &mut Self {
+            self.server_lines.push_back(line.to_string());
+            self
+        }
+
+        /// Everything the client has written so far, as a UTF-8 string.
+        pub fn written_str(&self) -> String {
+            String::from_utf8_lossy(&self.written).into_owned()
+        }
+
+        /// True if every queued server line has been consumed.
+        pub fn is_drained(&self) -> bool {
+            self.server_lines.is_empty()
+        }
+    }
+
+    impl Default for MockSmtpStream {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SmtpStream for MockSmtpStream {
+        fn read_line(&mut self) -> Result<String, String> {
+            self.server_lines
+                .pop_front()
+                .ok_or_else(|| "mock: no more server lines".to_string())
+        }
+        fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
+            self.written.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Test double for [`SmtpStreamFactory`]. Owns a single [`MockSmtpStream`]
+    /// the test pre-loads with server responses and inspects after the program
+    /// has run.
+    pub struct MockSmtpStreamFactory {
+        pub stream: MockSmtpStream,
+        pub open_count: usize,
+        /// If set, `open` returns this error instead of a stream. Used to test
+        /// the "couldn't connect" path.
+        pub fail_with: Option<String>,
+    }
+
+    impl MockSmtpStreamFactory {
+        pub fn new() -> Self {
+            Self {
+                stream: MockSmtpStream::new(),
+                open_count: 0,
+                fail_with: None,
+            }
+        }
+    }
+
+    impl Default for MockSmtpStreamFactory {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SmtpStreamFactory for MockSmtpStreamFactory {
+        fn open(&mut self, _host: &str, _port: u16) -> Result<&mut dyn SmtpStream, String> {
+            self.open_count += 1;
+            if let Some(e) = &self.fail_with {
+                return Err(e.clone());
+            }
+            Ok(&mut self.stream)
+        }
     }
 }

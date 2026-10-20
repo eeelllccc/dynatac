@@ -648,6 +648,9 @@ impl Transport for SimTransport {
 }
 
 #[cfg(test)]
+mod replay;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::modem::at::{AtEvent, AtParser};

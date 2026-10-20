@@ -25,56 +25,8 @@ pub trait WifiDriver {
     fn disconnect(&mut self) -> Result<(), String>;
 }
 
-/// Test double: 3 hardcoded networks, in-memory connection tracking.
-pub struct MockWifiDriver {
-    networks: Vec<String>,
-    connected: Option<String>,
-}
-
-impl MockWifiDriver {
-    pub fn new() -> Self {
-        Self {
-            networks: vec![
-                "home_wifi".to_string(),
-                "coffee_shop".to_string(),
-                "neighbor_5g".to_string(),
-            ],
-            connected: None,
-        }
-    }
-}
-
-impl WifiDriver for MockWifiDriver {
-    fn scan(&mut self) -> Vec<String> {
-        self.networks.clone()
-    }
-
-    fn status(&self) -> WifiStatus {
-        match &self.connected {
-            Some(name) => WifiStatus::Connected(name.clone()),
-            None => WifiStatus::Disconnected,
-        }
-    }
-
-    fn connect(&mut self, network: &str, _password: &str) -> Result<(), String> {
-        if !self.networks.iter().any(|n| n == network) {
-            return Err(format!("network not found: {}", network));
-        }
-        self.connected = Some(network.to_string());
-        Ok(())
-    }
-
-    fn disconnect(&mut self) -> Result<(), String> {
-        if self.connected.is_none() {
-            return Err("not connected".to_string());
-        }
-        self.connected = None;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -128,5 +80,55 @@ mod tests {
         driver.connect("home_wifi", "").unwrap();
         driver.connect("coffee_shop", "").unwrap();
         assert_eq!(driver.status(), WifiStatus::Connected("coffee_shop".to_string()));
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// Test double: 3 hardcoded networks, in-memory connection tracking.
+    pub struct MockWifiDriver {
+        networks: Vec<String>,
+        connected: Option<String>,
+    }
+
+    impl MockWifiDriver {
+        pub fn new() -> Self {
+            Self {
+                networks: vec![
+                    "home_wifi".to_string(),
+                    "coffee_shop".to_string(),
+                    "neighbor_5g".to_string(),
+                ],
+                connected: None,
+            }
+        }
+    }
+
+    impl WifiDriver for MockWifiDriver {
+        fn scan(&mut self) -> Vec<String> {
+            self.networks.clone()
+        }
+
+        fn status(&self) -> WifiStatus {
+            match &self.connected {
+                Some(name) => WifiStatus::Connected(name.clone()),
+                None => WifiStatus::Disconnected,
+            }
+        }
+
+        fn connect(&mut self, network: &str, _password: &str) -> Result<(), String> {
+            if !self.networks.iter().any(|n| n == network) {
+                return Err(format!("network not found: {}", network));
+            }
+            self.connected = Some(network.to_string());
+            Ok(())
+        }
+
+        fn disconnect(&mut self) -> Result<(), String> {
+            if self.connected.is_none() {
+                return Err("not connected".to_string());
+            }
+            self.connected = None;
+            Ok(())
+        }
     }
 }

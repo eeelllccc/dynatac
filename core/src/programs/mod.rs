@@ -179,14 +179,14 @@ pub static PROGRAMS: &[Program] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battery::MockBatteryDriver;
-    use crate::charger::MockChargerDriver;
-    use crate::credentials::MockCredentialStore;
-    use crate::email::MockSmtpStreamFactory;
-    use crate::http::MockHttpClient;
-    use crate::modem::MockModem;
-    use crate::saved_networks::MockNetworkStore;
-    use crate::wifi::MockWifiDriver;
+    use crate::battery::tests::MockBatteryDriver;
+    use crate::charger::tests::MockChargerDriver;
+    use crate::credentials::tests::MockCredentialStore;
+    use crate::email::tests::MockSmtpStreamFactory;
+    use crate::http::tests::MockHttpClient;
+    use crate::modem::tests::MockModem;
+    use crate::saved_networks::tests::MockNetworkStore;
+    use crate::wifi::tests::MockWifiDriver;
 
     #[test]
     fn no_args_returns_registry_usage() {

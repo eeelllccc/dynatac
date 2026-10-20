@@ -1,7 +1,7 @@
 //! Persistent storage for WiFi credentials (SSID → password).
 //!
 //! The [`NetworkStore`] trait abstracts over the storage backend.
-//! [`MockNetworkStore`] provides an in-memory implementation for tests.
+//! `tests::MockNetworkStore` (test builds only) provides an in-memory implementation for tests.
 //! [`serialise_entries`] / [`parse_entries`] are the canonical text format
 //! used by the NVS-backed implementation in `device/src/nvs_network_store.rs`,
 //! lifted into `core/` so they can be host-tested.
@@ -11,7 +11,6 @@
 //!   - `delete()` is a no-op if the SSID is not saved
 //!   - `list()` returns SSIDs in no guaranteed order
 
-use std::collections::HashMap;
 
 /// Persistence backend for saved WiFi credentials.
 pub trait NetworkStore {
@@ -23,38 +22,6 @@ pub trait NetworkStore {
     fn delete(&mut self, ssid: &str);
     /// List all saved SSIDs.
     fn list(&self) -> Vec<String>;
-}
-
-/// In-memory implementation for tests.
-pub struct MockNetworkStore {
-    credentials: HashMap<String, String>,
-}
-
-impl MockNetworkStore {
-    pub fn new() -> Self {
-        Self {
-            credentials: HashMap::new(),
-        }
-    }
-}
-
-impl NetworkStore for MockNetworkStore {
-    fn load(&self, ssid: &str) -> Option<String> {
-        self.credentials.get(ssid).cloned()
-    }
-
-    fn save(&mut self, ssid: &str, password: &str) {
-        self.credentials
-            .insert(ssid.to_string(), password.to_string());
-    }
-
-    fn delete(&mut self, ssid: &str) {
-        self.credentials.remove(ssid);
-    }
-
-    fn list(&self) -> Vec<String> {
-        self.credentials.keys().cloned().collect()
-    }
 }
 
 /// Serialise a list of `(ssid, password)` pairs into a single string suitable
@@ -91,8 +58,9 @@ pub fn parse_entries(s: &str) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn load_returns_none_when_empty() {
@@ -209,5 +177,39 @@ mod tests {
         let entries = vec![("".to_string(), "pw".to_string())];
         let s = serialise_entries(&entries);
         assert_eq!(parse_entries(&s), entries);
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// In-memory implementation for tests.
+    pub struct MockNetworkStore {
+        credentials: HashMap<String, String>,
+    }
+
+    impl MockNetworkStore {
+        pub fn new() -> Self {
+            Self {
+                credentials: HashMap::new(),
+            }
+        }
+    }
+
+    impl NetworkStore for MockNetworkStore {
+        fn load(&self, ssid: &str) -> Option<String> {
+            self.credentials.get(ssid).cloned()
+        }
+
+        fn save(&mut self, ssid: &str, password: &str) {
+            self.credentials
+                .insert(ssid.to_string(), password.to_string());
+        }
+
+        fn delete(&mut self, ssid: &str) {
+            self.credentials.remove(ssid);
+        }
+
+        fn list(&self) -> Vec<String> {
+            self.credentials.keys().cloned().collect()
+        }
     }
 }

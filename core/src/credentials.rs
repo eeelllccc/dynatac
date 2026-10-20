@@ -1,7 +1,7 @@
 //! Persistent storage for application credentials (Gmail, WhatsApp bridge).
 //!
 //! The [`CredentialStore`] trait abstracts over the storage backend.
-//! [`MockCredentialStore`] is the in-memory implementation used by tests;
+//! `tests::MockCredentialStore` (test builds only) is the in-memory implementation used by tests;
 //! the device builds a real one on top of NVS.
 //!
 //! Store invariants:
@@ -39,54 +39,8 @@ pub trait CredentialStore {
     fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String>;
 }
 
-/// In-memory implementation for tests.
-pub struct MockCredentialStore {
-    gmail: Option<GmailCreds>,
-    whatsapp: Option<WhatsappCreds>,
-}
-
-impl MockCredentialStore {
-    pub fn new() -> Self {
-        Self { gmail: None, whatsapp: None }
-    }
-}
-
-impl Default for MockCredentialStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CredentialStore for MockCredentialStore {
-    fn gmail(&self) -> Option<GmailCreds> {
-        self.gmail.clone()
-    }
-    fn set_gmail(&mut self, address: &str, app_password: &str) -> Result<(), String> {
-        self.gmail = Some(GmailCreds {
-            address: address.to_string(),
-            app_password: app_password.to_string(),
-        });
-        Ok(())
-    }
-    fn clear_gmail(&mut self) -> Result<(), String> {
-        self.gmail = None;
-        Ok(())
-    }
-
-    fn whatsapp(&self) -> Option<WhatsappCreds> {
-        self.whatsapp.clone()
-    }
-    fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String> {
-        self.whatsapp = Some(WhatsappCreds {
-            base_url: base_url.to_string(),
-            bearer_token: bearer_token.to_string(),
-        });
-        Ok(())
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -126,5 +80,53 @@ mod tests {
     fn clear_when_empty_is_ok() {
         let mut store = MockCredentialStore::new();
         store.clear_gmail().unwrap();
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// In-memory implementation for tests.
+    pub struct MockCredentialStore {
+        gmail: Option<GmailCreds>,
+        whatsapp: Option<WhatsappCreds>,
+    }
+
+    impl MockCredentialStore {
+        pub fn new() -> Self {
+            Self { gmail: None, whatsapp: None }
+        }
+    }
+
+    impl Default for MockCredentialStore {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl CredentialStore for MockCredentialStore {
+        fn gmail(&self) -> Option<GmailCreds> {
+            self.gmail.clone()
+        }
+        fn set_gmail(&mut self, address: &str, app_password: &str) -> Result<(), String> {
+            self.gmail = Some(GmailCreds {
+                address: address.to_string(),
+                app_password: app_password.to_string(),
+            });
+            Ok(())
+        }
+        fn clear_gmail(&mut self) -> Result<(), String> {
+            self.gmail = None;
+            Ok(())
+        }
+
+        fn whatsapp(&self) -> Option<WhatsappCreds> {
+            self.whatsapp.clone()
+        }
+        fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String> {
+            self.whatsapp = Some(WhatsappCreds {
+                base_url: base_url.to_string(),
+                bearer_token: bearer_token.to_string(),
+            });
+            Ok(())
+        }
     }
 }

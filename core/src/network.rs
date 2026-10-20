@@ -106,8 +106,10 @@ pub fn ensure_connectivity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modem::{MockModem, ModemError};
-    use crate::wifi::{MockWifiDriver, WifiDriver};
+    use crate::modem::ModemError;
+    use crate::modem::tests::MockModem;
+    use crate::wifi::WifiDriver;
+    use crate::wifi::tests::MockWifiDriver;
 
     #[test]
     fn uses_wifi_when_connected() {

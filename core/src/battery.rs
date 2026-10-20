@@ -230,60 +230,8 @@ pub fn dm_packet_length(data_len: usize) -> u8 {
     (data_len + 4) as u8
 }
 
-/// In-memory test double for [`BatteryDriver`]. Default state is a
-/// healthy mid-charge battery; tests can override the fields directly.
-pub struct MockBatteryDriver {
-    pub level: Result<u8, BatteryError>,
-    pub charge_state: Result<ChargeState, BatteryError>,
-    pub diag: Result<BatteryDiag, BatteryError>,
-    pub provision_result: Result<(), BatteryError>,
-}
-
-impl MockBatteryDriver {
-    pub fn new() -> Self {
-        Self {
-            level: Ok(75),
-            charge_state: Ok(ChargeState::Discharging),
-            diag: Ok(BatteryDiag {
-                initcomp: true,
-                cfg_update: false,
-                design_capacity_mah: 1400,
-                full_charge_capacity_mah: 1400,
-                remaining_capacity_mah: 1050,
-                voltage_mv: 3842,
-                current_ma: 245,
-            }),
-            provision_result: Ok(()),
-        }
-    }
-}
-
-impl Default for MockBatteryDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BatteryDriver for MockBatteryDriver {
-    fn level(&mut self) -> Result<u8, BatteryError> {
-        self.level.clone()
-    }
-
-    fn charge_state(&mut self) -> Result<ChargeState, BatteryError> {
-        self.charge_state.clone()
-    }
-
-    fn diag(&mut self) -> Result<BatteryDiag, BatteryError> {
-        self.diag.clone()
-    }
-
-    fn provision(&mut self) -> Result<(), BatteryError> {
-        self.provision_result
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -429,5 +377,59 @@ mod tests {
             .find(|e| e.address == 0x929D)
             .expect("FullChargeCapacity entry missing");
         assert!(matches!(entry.data, DmData::U16(1400)));
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// In-memory test double for [`BatteryDriver`]. Default state is a
+    /// healthy mid-charge battery; tests can override the fields directly.
+    pub struct MockBatteryDriver {
+        pub level: Result<u8, BatteryError>,
+        pub charge_state: Result<ChargeState, BatteryError>,
+        pub diag: Result<BatteryDiag, BatteryError>,
+        pub provision_result: Result<(), BatteryError>,
+    }
+
+    impl MockBatteryDriver {
+        pub fn new() -> Self {
+            Self {
+                level: Ok(75),
+                charge_state: Ok(ChargeState::Discharging),
+                diag: Ok(BatteryDiag {
+                    initcomp: true,
+                    cfg_update: false,
+                    design_capacity_mah: 1400,
+                    full_charge_capacity_mah: 1400,
+                    remaining_capacity_mah: 1050,
+                    voltage_mv: 3842,
+                    current_ma: 245,
+                }),
+                provision_result: Ok(()),
+            }
+        }
+    }
+
+    impl Default for MockBatteryDriver {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl BatteryDriver for MockBatteryDriver {
+        fn level(&mut self) -> Result<u8, BatteryError> {
+            self.level.clone()
+        }
+
+        fn charge_state(&mut self) -> Result<ChargeState, BatteryError> {
+            self.charge_state.clone()
+        }
+
+        fn diag(&mut self) -> Result<BatteryDiag, BatteryError> {
+            self.diag.clone()
+        }
+
+        fn provision(&mut self) -> Result<(), BatteryError> {
+            self.provision_result
+        }
     }
 }

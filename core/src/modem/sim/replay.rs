@@ -14,14 +14,14 @@
 //! the real time (call durations within 1 s). One captured race is allowed: whether the bearer URC
 //! lands just before or just after `ATD`'s `OK` (see `golden_traces.rs`).
 
-use dynatac_core::modem::at::{AtEvent, AtParser};
-use dynatac_core::modem::link::Millis;
-use dynatac_core::modem::sim::{Sim, SimConfig};
-use dynatac_core::modem::trace::{parse_trace, timeline, Direction, Step, TraceRecord};
+use crate::modem::at::{AtEvent, AtParser};
+use crate::modem::link::Millis;
+use crate::modem::sim::{Sim, SimConfig};
+use crate::modem::trace::{parse_trace, timeline, Direction, Step, TraceRecord};
 
 macro_rules! fixture {
     ($name:literal) => {
-        ($name, include_str!(concat!("fixtures/modem/", $name, ".trace")))
+        ($name, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/modem/", $name, ".trace")))
     };
 }
 

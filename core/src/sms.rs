@@ -2,7 +2,7 @@
 //!
 //! All operations live as free functions parameterised by `&mut dyn Modem`,
 //! rather than behind a separate `SmsDriver` trait. There's only one real
-//! implementation (the modem we already have); tests use [`MockModem`]
+//! implementation (the modem we already have); tests use `modem::tests::MockModem`
 //! directly with scripted responses, which keeps the surface area minimal.
 //!
 //! Mode: text mode (`AT+CMGF=1`) with the GSM character set
@@ -346,7 +346,7 @@ pub fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modem::MockModem;
+    use crate::modem::tests::MockModem;
 
     fn powered_modem() -> MockModem {
         let mut m = MockModem::new();

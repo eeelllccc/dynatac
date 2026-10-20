@@ -77,37 +77,8 @@ pub trait ChargerDriver {
     fn shutdown(&mut self) -> Result<(), ChargerError>;
 }
 
-/// In-memory test double for [`ChargerDriver`]. Records whether
-/// shutdown was called.
-pub struct MockChargerDriver {
-    pub shutdown_result: Result<(), ChargerError>,
-    pub shutdown_called: bool,
-}
-
-impl MockChargerDriver {
-    pub fn new() -> Self {
-        Self {
-            shutdown_result: Ok(()),
-            shutdown_called: false,
-        }
-    }
-}
-
-impl Default for MockChargerDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ChargerDriver for MockChargerDriver {
-    fn shutdown(&mut self) -> Result<(), ChargerError> {
-        self.shutdown_called = true;
-        self.shutdown_result
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -186,5 +157,36 @@ mod tests {
         assert_eq!(reg, 0b0000_0000);
         let reg = enter_ship_mode(reg);
         assert_eq!(reg, 0b0010_0000); // BATFET_DIS now set
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// In-memory test double for [`ChargerDriver`]. Records whether
+    /// shutdown was called.
+    pub struct MockChargerDriver {
+        pub shutdown_result: Result<(), ChargerError>,
+        pub shutdown_called: bool,
+    }
+
+    impl MockChargerDriver {
+        pub fn new() -> Self {
+            Self {
+                shutdown_result: Ok(()),
+                shutdown_called: false,
+            }
+        }
+    }
+
+    impl Default for MockChargerDriver {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl ChargerDriver for MockChargerDriver {
+        fn shutdown(&mut self) -> Result<(), ChargerError> {
+            self.shutdown_called = true;
+            self.shutdown_result
+        }
     }
 }

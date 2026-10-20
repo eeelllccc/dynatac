@@ -110,14 +110,16 @@ fn forget(ctx: &mut ExecContext) -> ProgramResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battery::MockBatteryDriver;
-    use crate::credentials::MockCredentialStore;
-    use crate::charger::MockChargerDriver;
-    use crate::email::MockSmtpStreamFactory;
-    use crate::http::MockHttpClient;
-    use crate::modem::MockModem;
-    use crate::saved_networks::{MockNetworkStore, NetworkStore};
-    use crate::wifi::{MockWifiDriver, WifiDriver};
+    use crate::battery::tests::MockBatteryDriver;
+    use crate::credentials::tests::MockCredentialStore;
+    use crate::charger::tests::MockChargerDriver;
+    use crate::email::tests::MockSmtpStreamFactory;
+    use crate::http::tests::MockHttpClient;
+    use crate::modem::tests::MockModem;
+    use crate::saved_networks::NetworkStore;
+    use crate::saved_networks::tests::MockNetworkStore;
+    use crate::wifi::WifiDriver;
+    use crate::wifi::tests::MockWifiDriver;
 
     struct Env {
         wifi: MockWifiDriver,

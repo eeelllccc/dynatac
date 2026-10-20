@@ -44,8 +44,10 @@ fn auto_connect_wifi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saved_networks::{MockNetworkStore, NetworkStore};
-    use crate::wifi::{MockWifiDriver, WifiDriver, WifiStatus};
+    use crate::saved_networks::NetworkStore;
+    use crate::saved_networks::tests::MockNetworkStore;
+    use crate::wifi::{WifiDriver, WifiStatus};
+    use crate::wifi::tests::MockWifiDriver;
 
     #[test]
     fn no_saved_networks() {

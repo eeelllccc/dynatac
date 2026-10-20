@@ -1,13 +1,13 @@
 //! The whole modem stack (L0 transport → L1 link → L2 HAL, via the shared
 //! driver loop) against the simulated A7682E.
 
-use dynatac_core::modem::driver;
-use dynatac_core::modem::hal::{Event, Hal, Output, RequestError, RequestId};
-use dynatac_core::modem::link::{Millis, UnknownReason, UnsyncReason};
-use dynatac_core::modem::request::{Gain, PhoneNumber, Request, Response};
-use dynatac_core::modem::sim::{Sim, SimConfig, SimTransport};
-use dynatac_core::modem::transport::Clock;
-use dynatac_core::modem::unsolicited::{CallState, Unsolicited};
+use crate::modem::driver;
+use crate::modem::hal::{Event, Hal, Output, RequestError, RequestId};
+use crate::modem::link::{Millis, UnknownReason, UnsyncReason};
+use crate::modem::request::{Gain, PhoneNumber, Request, Response};
+use crate::modem::sim::{Sim, SimConfig, SimTransport};
+use crate::modem::transport::Clock;
+use crate::modem::unsolicited::{CallState, Unsolicited};
 
 struct Stack {
     hal: Hal,

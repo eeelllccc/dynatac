@@ -330,14 +330,16 @@ fn format_message(msg: &Message) -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battery::MockBatteryDriver;
-    use crate::charger::MockChargerDriver;
-    use crate::credentials::{CredentialStore, MockCredentialStore};
-    use crate::email::MockSmtpStreamFactory;
-    use crate::http::MockHttpClient;
-    use crate::modem::MockModem;
-    use crate::saved_networks::MockNetworkStore;
-    use crate::wifi::{MockWifiDriver, WifiDriver};
+    use crate::battery::tests::MockBatteryDriver;
+    use crate::charger::tests::MockChargerDriver;
+    use crate::credentials::CredentialStore;
+    use crate::credentials::tests::MockCredentialStore;
+    use crate::email::tests::MockSmtpStreamFactory;
+    use crate::http::tests::MockHttpClient;
+    use crate::modem::tests::MockModem;
+    use crate::saved_networks::tests::MockNetworkStore;
+    use crate::wifi::WifiDriver;
+    use crate::wifi::tests::MockWifiDriver;
 
     const BASE_URL: &str = "https://wa.example.com";
     const TOKEN: &str = "secret-token";

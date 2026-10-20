@@ -314,6 +314,9 @@ impl Default for Hal {
 }
 
 #[cfg(test)]
+mod on_sim;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::modem::link::QUIET_MS;

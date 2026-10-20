@@ -3,7 +3,7 @@
 //! The [`Modem`] trait is the high-level interface to an AT-commandable
 //! cellular modem. The hardware implementation lives in
 //! `device/src/modem.rs` and wraps the A7682E attached to UART1 of the
-//! ESP32-S3. [`MockModem`] provides an in-memory double for host-side
+//! ESP32-S3. `tests::MockModem` (test builds only) provides an in-memory double for host-side
 //! tests of code that depends on the trait.
 //!
 //! The low-level AT response parser is in the [`at`] submodule and is
@@ -27,8 +27,11 @@ pub mod at;
 pub mod driver;
 pub mod hal;
 pub mod link;
+pub mod port;
 pub mod request;
-pub mod sim;
+/// Byte-level A7682E simulator: test builds only.
+#[cfg(test)]
+pub(crate) mod sim;
 pub mod trace;
 pub mod unsolicited;
 pub mod transport;
@@ -231,157 +234,8 @@ pub trait Modem {
     fn is_data_active(&self) -> bool;
 }
 
-/// In-memory test double for [`Modem`].
-///
-/// Tracks power state and returns scripted responses for `send_raw` and
-/// `send_with_body`. Also records the bodies passed to `send_with_body`
-/// so tests can assert they were encoded correctly.
-///
-/// The default status is "registered, SIM ready, strong signal" so
-/// programs that only inspect `status()` work without setup.
-pub struct MockModem {
-    powered: bool,
-    status: ModemStatus,
-    raw_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
-    body_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
-    data_active: bool,
-    /// APN passed to the last successful `enable_data` call, for test
-    /// assertions. `None` if data has never been enabled.
-    pub last_apn: Option<String>,
-    /// Forced error for the next `enable_data` call, to simulate modem
-    /// failures. Consumed on use.
-    pub enable_data_error: Option<ModemError>,
-    /// All commands sent via `send_raw`, in order.
-    pub raw_log: Vec<String>,
-    /// All `(cmd, body)` pairs sent via `send_with_body`, in order.
-    pub body_log: Vec<(String, Vec<u8>)>,
-}
-
-impl MockModem {
-    pub fn new() -> Self {
-        Self {
-            powered: false,
-            status: ModemStatus {
-                responsive: true,
-                sim: SimStatus::Ready,
-                registration: RegistrationStatus::RegisteredHome,
-                signal_dbm: Some(-71),
-            },
-            raw_responses: std::collections::HashMap::new(),
-            body_responses: std::collections::HashMap::new(),
-            data_active: false,
-            last_apn: None,
-            enable_data_error: None,
-            raw_log: Vec::new(),
-            body_log: Vec::new(),
-        }
-    }
-
-    /// Override the status returned by `status()`.
-    pub fn set_status(&mut self, status: ModemStatus) {
-        self.status = status;
-    }
-
-    /// Register a canned response for a raw command.
-    pub fn on_raw(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
-        self.raw_responses.insert(cmd.to_string(), response);
-    }
-
-    /// Register a canned response for a `send_with_body` command. The body
-    /// is not part of the key — the script reacts based on the command
-    /// alone, mirroring how the real modem responds the same way regardless
-    /// of body content for valid commands.
-    pub fn on_with_body(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
-        self.body_responses.insert(cmd.to_string(), response);
-    }
-}
-
-impl Default for MockModem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Modem for MockModem {
-    fn power_on(&mut self) -> Result<(), ModemError> {
-        self.powered = true;
-        self.status.responsive = true;
-        Ok(())
-    }
-
-    fn power_off(&mut self) -> Result<(), ModemError> {
-        // Mirror the real EspA7682EModem: tear down any active data
-        // session before powering off so tests reflect the invariant
-        // that a powered-off modem has no data session.
-        self.data_active = false;
-        self.powered = false;
-        self.status.responsive = false;
-        Ok(())
-    }
-
-    fn is_powered(&self) -> bool {
-        self.powered
-    }
-
-    fn status(&mut self) -> Result<ModemStatus, ModemError> {
-        if !self.powered {
-            return Err(ModemError::NotPowered);
-        }
-        Ok(self.status.clone())
-    }
-
-    fn send_raw(&mut self, cmd: &str) -> Result<Vec<String>, ModemError> {
-        if !self.powered {
-            return Err(ModemError::NotPowered);
-        }
-        if self.data_active {
-            return Err(ModemError::DataActive);
-        }
-        self.raw_log.push(cmd.to_string());
-        match self.raw_responses.get(cmd) {
-            Some(r) => r.clone(),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError> {
-        if !self.powered {
-            return Err(ModemError::NotPowered);
-        }
-        if self.data_active {
-            return Err(ModemError::DataActive);
-        }
-        self.body_log.push((cmd.to_string(), body.to_vec()));
-        match self.body_responses.get(cmd) {
-            Some(r) => r.clone(),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn enable_data(&mut self, apn: &str) -> Result<(), ModemError> {
-        if !self.powered {
-            return Err(ModemError::NotPowered);
-        }
-        if let Some(err) = self.enable_data_error.take() {
-            return Err(err);
-        }
-        self.data_active = true;
-        self.last_apn = Some(apn.to_string());
-        Ok(())
-    }
-
-    fn disable_data(&mut self) -> Result<(), ModemError> {
-        self.data_active = false;
-        Ok(())
-    }
-
-    fn is_data_active(&self) -> bool {
-        self.data_active
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -655,5 +509,151 @@ mod tests {
         assert_eq!(ModemError::NotPowered.display(), "modem is off");
         assert_eq!(ModemError::Timeout.display(), "modem timeout");
         assert_eq!(ModemError::CmeError(13).display(), "CME ERROR 13");
+    }
+
+    // --- test doubles (used by tests across the crate) ---
+
+    /// In-memory test double for [`Modem`].
+    ///
+    /// Tracks power state and returns scripted responses for `send_raw` and
+    /// `send_with_body`. Also records the bodies passed to `send_with_body`
+    /// so tests can assert they were encoded correctly.
+    ///
+    /// The default status is "registered, SIM ready, strong signal" so
+    /// programs that only inspect `status()` work without setup.
+    pub struct MockModem {
+        powered: bool,
+        status: ModemStatus,
+        raw_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
+        body_responses: std::collections::HashMap<String, Result<Vec<String>, ModemError>>,
+        data_active: bool,
+        /// APN passed to the last successful `enable_data` call, for test
+        /// assertions. `None` if data has never been enabled.
+        pub last_apn: Option<String>,
+        /// Forced error for the next `enable_data` call, to simulate modem
+        /// failures. Consumed on use.
+        pub enable_data_error: Option<ModemError>,
+        /// All commands sent via `send_raw`, in order.
+        pub raw_log: Vec<String>,
+        /// All `(cmd, body)` pairs sent via `send_with_body`, in order.
+        pub body_log: Vec<(String, Vec<u8>)>,
+    }
+
+    impl MockModem {
+        pub fn new() -> Self {
+            Self {
+                powered: false,
+                status: ModemStatus {
+                    responsive: true,
+                    sim: SimStatus::Ready,
+                    registration: RegistrationStatus::RegisteredHome,
+                    signal_dbm: Some(-71),
+                },
+                raw_responses: std::collections::HashMap::new(),
+                body_responses: std::collections::HashMap::new(),
+                data_active: false,
+                last_apn: None,
+                enable_data_error: None,
+                raw_log: Vec::new(),
+                body_log: Vec::new(),
+            }
+        }
+
+        /// Register a canned response for a raw command.
+        pub fn on_raw(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
+            self.raw_responses.insert(cmd.to_string(), response);
+        }
+
+        /// Register a canned response for a `send_with_body` command. The body
+        /// is not part of the key — the script reacts based on the command
+        /// alone, mirroring how the real modem responds the same way regardless
+        /// of body content for valid commands.
+        pub fn on_with_body(&mut self, cmd: &str, response: Result<Vec<String>, ModemError>) {
+            self.body_responses.insert(cmd.to_string(), response);
+        }
+    }
+
+    impl Default for MockModem {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Modem for MockModem {
+        fn power_on(&mut self) -> Result<(), ModemError> {
+            self.powered = true;
+            self.status.responsive = true;
+            Ok(())
+        }
+
+        fn power_off(&mut self) -> Result<(), ModemError> {
+            // Mirror the real EspA7682EModem: tear down any active data
+            // session before powering off so tests reflect the invariant
+            // that a powered-off modem has no data session.
+            self.data_active = false;
+            self.powered = false;
+            self.status.responsive = false;
+            Ok(())
+        }
+
+        fn is_powered(&self) -> bool {
+            self.powered
+        }
+
+        fn status(&mut self) -> Result<ModemStatus, ModemError> {
+            if !self.powered {
+                return Err(ModemError::NotPowered);
+            }
+            Ok(self.status.clone())
+        }
+
+        fn send_raw(&mut self, cmd: &str) -> Result<Vec<String>, ModemError> {
+            if !self.powered {
+                return Err(ModemError::NotPowered);
+            }
+            if self.data_active {
+                return Err(ModemError::DataActive);
+            }
+            self.raw_log.push(cmd.to_string());
+            match self.raw_responses.get(cmd) {
+                Some(r) => r.clone(),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn send_with_body(&mut self, cmd: &str, body: &[u8]) -> Result<Vec<String>, ModemError> {
+            if !self.powered {
+                return Err(ModemError::NotPowered);
+            }
+            if self.data_active {
+                return Err(ModemError::DataActive);
+            }
+            self.body_log.push((cmd.to_string(), body.to_vec()));
+            match self.body_responses.get(cmd) {
+                Some(r) => r.clone(),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        fn enable_data(&mut self, apn: &str) -> Result<(), ModemError> {
+            if !self.powered {
+                return Err(ModemError::NotPowered);
+            }
+            if let Some(err) = self.enable_data_error.take() {
+                return Err(err);
+            }
+            self.data_active = true;
+            self.last_apn = Some(apn.to_string());
+            Ok(())
+        }
+
+        fn disable_data(&mut self) -> Result<(), ModemError> {
+            self.data_active = false;
+            Ok(())
+        }
+
+        fn is_data_active(&self) -> bool {
+            self.data_active
+        }
     }
 }

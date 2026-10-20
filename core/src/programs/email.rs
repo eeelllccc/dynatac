@@ -160,14 +160,17 @@ fn cancel_or_empty_error(ctx: &mut ExecContext) -> ProgramResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::battery::MockBatteryDriver;
-    use crate::charger::MockChargerDriver;
-    use crate::credentials::{CredentialStore, MockCredentialStore};
-    use crate::email::MockSmtpStreamFactory;
-    use crate::http::MockHttpClient;
-    use crate::saved_networks::MockNetworkStore;
-    use crate::modem::{MockModem, Modem};
-    use crate::wifi::{MockWifiDriver, WifiDriver};
+    use crate::battery::tests::MockBatteryDriver;
+    use crate::charger::tests::MockChargerDriver;
+    use crate::credentials::CredentialStore;
+    use crate::credentials::tests::MockCredentialStore;
+    use crate::email::tests::MockSmtpStreamFactory;
+    use crate::http::tests::MockHttpClient;
+    use crate::saved_networks::tests::MockNetworkStore;
+    use crate::modem::Modem;
+    use crate::modem::tests::MockModem;
+    use crate::wifi::WifiDriver;
+    use crate::wifi::tests::MockWifiDriver;
 
     struct Env {
         wifi: MockWifiDriver,
