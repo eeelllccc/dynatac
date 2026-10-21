@@ -23,14 +23,17 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 use dynatac_core::keymap::KeyEvent;
 use keyboard::Keyboard;
 
-/// Max characters per line (240px / 8px per glyph = 30).
-const LINE_COLS: usize = (display::WIDTH as usize) / 8;
+const FONT: FontSize = FontSize::Medium;
+
+/// Max characters per line.
+const LINE_COLS: usize = (display::WIDTH / FONT.width()) as usize;
 
 /// The text line sits at the very bottom of the 320-pixel-tall display.
-const LINE_Y: u16 = display::HEIGHT - 8;
+const LINE_Y: u16 = display::HEIGHT - FONT.height();
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -154,18 +157,18 @@ fn drain_keys(kb: &mut Keyboard, buf: &mut [char; LINE_COLS], cursor: &mut usize
 
 /// Redraw the bottom line into the desired buffer (no display I/O).
 fn redraw_line(epd: &mut Epd, buf: &[char; LINE_COLS], cursor: usize) {
-    epd.clear_line(LINE_Y);
+    epd.clear_line(LINE_Y, FONT.height());
 
     for (i, &ch) in buf.iter().enumerate() {
         if ch == '\0' {
             break;
         }
-        let x = (i * 8) as u8;
-        epd.draw_char(x, LINE_Y, ch).unwrap();
+        let x = i as u16 * FONT.width();
+        epd.draw_glyph(x, LINE_Y, FONT.font(), ch);
     }
 
     if cursor < LINE_COLS {
-        let x = (cursor * 8) as u8;
-        epd.draw_char(x, LINE_Y, '_').unwrap();
+        let x = cursor as u16 * FONT.width();
+        epd.draw_glyph(x, LINE_Y, FONT.font(), '_');
     }
 }

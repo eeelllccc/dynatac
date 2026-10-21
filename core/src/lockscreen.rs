@@ -1,14 +1,8 @@
-// Lockscreen rendering: a chunky, all-caps DYNATAC logo across the
-// bottom of the e-paper display.
-//
-// We don't ship a separate large font for this. Instead the existing
-// 8×8 bitmap font in `framebuffer` is scaled up by an integer factor:
-// each source pixel becomes a `SCALE_X × SCALE_Y` rectangle in the
-// destination framebuffer. This is "chunky, straight-edged, all caps"
-// by construction, and reuses code that's already shipping.
+// Lockscreen rendering: the chunky, all-caps DYNATAC logo (see `logo`)
+// large across the bottom of the e-paper display.
 //
 // Layout:
-//   - Each glyph is 8×8 source → 32×40 destination (SCALE_X=4, SCALE_Y=5).
+//   - Each logo letter is 8×8 source → 32×40 destination (SCALE_X=4, SCALE_Y=5).
 //   - Logo width = 7 letters × 32 = 224 px, centred in 240 → 8 px margins.
 //   - Logo y position is `LOGO_Y_TOP`, leaving an 8 px margin from the
 //     bottom of the 320-row display.
@@ -17,25 +11,20 @@
 //   - The framebuffer is the standard `WIDTH × HEIGHT` (240×320) buffer.
 //   - The caller is responsible for flushing after `render`.
 
-use crate::framebuffer::{glyph_8x8, FrameBuffer, HEIGHT, WIDTH};
+use crate::framebuffer::{FrameBuffer, Ink, HEIGHT, WIDTH};
+use crate::geometry::Rect;
+use crate::logo;
+use crate::surface::Surface;
 
 /// Per-pixel horizontal scale.
 pub const SCALE_X: u16 = 4;
 /// Per-pixel vertical scale.
 pub const SCALE_Y: u16 = 5;
 
-/// Width of one scaled glyph in pixels.
-pub const GLYPH_W: u16 = 8 * SCALE_X; // 32
-/// Height of one scaled glyph in pixels.
-pub const GLYPH_H: u16 = 8 * SCALE_Y; // 40
-
-/// The letters of the logo, in order.
-pub const LOGO_LETTERS: [char; 7] = ['D', 'Y', 'N', 'A', 'T', 'A', 'C'];
-
 /// Total logo width in pixels.
-pub const LOGO_WIDTH: u16 = GLYPH_W * (LOGO_LETTERS.len() as u16); // 224
+pub const LOGO_WIDTH: u16 = logo::size(SCALE_X, SCALE_Y).0; // 224
 /// Total logo height in pixels.
-pub const LOGO_HEIGHT: u16 = GLYPH_H; // 40
+pub const LOGO_HEIGHT: u16 = logo::size(SCALE_X, SCALE_Y).1; // 40
 
 /// Bottom margin between the logo and the bottom edge of the display.
 pub const BOTTOM_MARGIN: u16 = 8;
@@ -58,33 +47,30 @@ pub fn render(fb: &mut FrameBuffer) {
 /// Draw just the logo into the framebuffer, leaving the rest of the
 /// buffer untouched. Used by `render` and exposed separately for tests.
 pub fn draw_logo(fb: &mut FrameBuffer) {
-    for (letter_idx, &ch) in LOGO_LETTERS.iter().enumerate() {
-        let glyph = match glyph_8x8(ch) {
-            Some(g) => g,
-            None => continue,
-        };
-        let glyph_x_offset = LOGO_X_LEFT + (letter_idx as u16) * GLYPH_W;
-
-        for src_row in 0..8u16 {
-            let row_byte = glyph[src_row as usize];
-            for src_col in 0..8u16 {
-                let bit = 7 - src_col;
-                let on = (row_byte >> bit) & 1 == 1;
-                if !on {
-                    continue;
-                }
-                let dst_x = glyph_x_offset + src_col * SCALE_X;
-                let dst_y = LOGO_Y_TOP + src_row * SCALE_Y;
-                fb.fill_rect(dst_x, dst_y, SCALE_X, SCALE_Y, true);
-            }
-        }
-    }
+    let mut screen = Surface::new(fb, Rect::SCREEN);
+    logo::draw(&mut screen, LOGO_X_LEFT, LOGO_Y_TOP, SCALE_X, SCALE_Y, Ink::Black);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framebuffer::BYTES_PER_ROW;
+
+    /// FNV-1a over the whole rendered framebuffer.
+    fn render_hash() -> u64 {
+        let mut fb = FrameBuffer::new();
+        render(&mut fb);
+        (0..crate::framebuffer::BUF_LEN).fold(0xcbf29ce484222325u64, |h, i| {
+            (h ^ fb.desired_byte(i) as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    #[test]
+    fn lockscreen_image_is_unchanged() {
+        // Golden value: the lockscreen must stay pixel-identical.
+        assert_eq!(render_hash(), GOLDEN);
+    }
+    const GOLDEN: u64 = 4075822102365783067;
 
     #[test]
     fn dimensions_match_display() {
@@ -101,7 +87,7 @@ mod tests {
     fn render_clears_then_draws() {
         let mut fb = FrameBuffer::new();
         // Pre-soil the top of the framebuffer; render must wipe it.
-        fb.draw_char(0, 0, 'X');
+        fb.fill_rect(0, 0, WIDTH, 8, true);
         render(&mut fb);
 
         // Top row should be white again.
@@ -151,7 +137,7 @@ mod tests {
 
     #[test]
     fn d_top_row_has_black_pixels() {
-        // Sanity: the 8x8 'D' glyph has bits set in row 0, so the
+        // Sanity: the 'D' glyph has bits set in row 0, so the
         // scaled-up logo should have black pixels at the top of the D.
         let mut fb = FrameBuffer::new();
         render(&mut fb);

@@ -27,9 +27,11 @@ use esp_idf_svc::hal::gpio::{AnyIOPin, AnyOutputPin, Input, Output, PinDriver};
 use esp_idf_svc::hal::spi::{SpiDeviceDriver, SpiDriver};
 use esp_idf_svc::hal::sys::EspError;
 
+use dynatac_core::font::Font;
 use dynatac_core::framebuffer::{FrameBuffer, BUF_LEN};
 use dynatac_core::lockscreen;
 
+#[allow(unused_imports)] // used by the examples
 pub use dynatac_core::framebuffer::{WIDTH, HEIGHT};
 
 /// Driver for the GDEQ031T10 e-paper display (UC8253 controller, 240×320).
@@ -37,7 +39,8 @@ pub use dynatac_core::framebuffer::{WIDTH, HEIGHT};
 /// Wraps a `FrameBuffer` for pixel manipulation and manages SPI communication
 /// with the UC8253 controller for hardware refreshes.
 ///
-/// Call `draw_char` / `clear_line` to update the desired buffer, then call
+/// Call `draw_text` / `clear_line` (or draw into `fb` directly, e.g. via
+/// `TextGrid`) to update the desired buffer, then call
 /// `try_flush` in a loop.  `try_flush` is non-blocking: if the display is
 /// still refreshing it returns immediately.
 pub struct Epd<'d> {
@@ -218,15 +221,27 @@ impl<'d> Epd<'d> {
         self.update_full()
     }
 
-    /// Draw a character into the desired buffer. Does NOT push to hardware.
-    pub fn draw_char(&mut self, x: u8, y: u16, ch: char) -> Result<(), EspError> {
-        self.fb.draw_char(x, y, ch);
-        Ok(())
+    // The text helpers below are used by the examples; the main binary
+    // draws through `fb` with a `TextGrid` instead.
+
+    /// Draw one character cell into the desired buffer. Does NOT push to
+    /// hardware. See `FrameBuffer::draw_glyph`.
+    #[allow(dead_code)]
+    pub fn draw_glyph(&mut self, x: u16, y: u16, font: &Font, ch: char) {
+        self.fb.draw_glyph(x, y, font, ch);
     }
 
-    /// Clear the 8-pixel-tall strip at row `y` across the full display width.
-    pub fn clear_line(&mut self, y: u16) {
-        self.fb.clear_line(y);
+    /// Draw a run of text into the desired buffer. Does NOT push to
+    /// hardware. See `FrameBuffer::draw_text`.
+    #[allow(dead_code)]
+    pub fn draw_text(&mut self, x: u16, y: u16, font: &Font, text: &str) -> u16 {
+        self.fb.draw_text(x, y, font, text)
+    }
+
+    /// Clear the full-width strip of `height` pixel rows starting at `y`.
+    #[allow(dead_code)]
+    pub fn clear_line(&mut self, y: u16, height: u16) {
+        self.fb.clear_line(y, height);
     }
 
     /// Non-blocking flush. Sends the minimal dirty region to hardware.

@@ -48,6 +48,7 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::modem::{CallUrc, Modem};
 use i2c_bus::I2cBus;
@@ -55,7 +56,8 @@ use keyboard::Keyboard;
 use modem::EspA7682EModem;
 
 const KEYBOARD_ADDR: u8 = 0x34;
-const ROW_HEIGHT: u16 = 10;
+const FONT: FontSize = FontSize::Medium;
+const ROW_HEIGHT: u16 = FONT.height();
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -321,11 +323,8 @@ fn enter_number(epd: &mut Epd, kb: &mut Keyboard, y: &mut u16) -> String {
 }
 
 fn redraw_number(epd: &mut Epd, number: &str, y: &mut u16) {
-    epd.clear_line(*y);
-    let display = format!("> {}_", number);
-    for (i, ch) in display.chars().take(30).enumerate() {
-        epd.draw_char((i * 8) as u8, *y, ch).unwrap();
-    }
+    epd.clear_line(*y, ROW_HEIGHT);
+    epd.draw_text(0, *y, FONT.font(), &format!("> {}_", number));
     let _ = epd.try_flush();
 }
 
@@ -383,18 +382,14 @@ fn fmt_level(level: Option<u8>) -> String {
 /// Overwrite a single row in place (no flush).
 fn draw_line_at(epd: &mut Epd, text: &str, y: u16) {
     if y >= display::HEIGHT { return; }
-    epd.clear_line(y);
-    for (i, ch) in text.chars().take(30).enumerate() {
-        epd.draw_char((i * 8) as u8, y, ch).unwrap();
-    }
+    epd.clear_line(y, ROW_HEIGHT);
+    epd.draw_text(0, y, FONT.font(), text);
 }
 
 fn print_line(epd: &mut Epd, text: &str, y: &mut u16) {
     if *y >= display::HEIGHT { return; }
-    epd.clear_line(*y);
-    for (i, ch) in text.chars().take(30).enumerate() {
-        epd.draw_char((i * 8) as u8, *y, ch).unwrap();
-    }
+    epd.clear_line(*y, ROW_HEIGHT);
+    epd.draw_text(0, *y, FONT.font(), text);
     let _ = epd.try_flush();
     *y += ROW_HEIGHT;
 }

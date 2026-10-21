@@ -17,6 +17,7 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -78,18 +79,17 @@ fn main() {
     epd.clear().unwrap();
 
     let text = "Hello World!";
-    let char_w: usize = 8;
-    let char_h: usize = 8;
+    let font = FontSize::Large.font();
 
-    let x_start: usize = (display::WIDTH as usize - text.len() * char_w) / 2;
-    let y: u16        = (display::HEIGHT - char_h as u16) / 2;
+    let x_start: u16 = (display::WIDTH - text.len() as u16 * font.width()) / 2;
+    let y: u16       = (display::HEIGHT - font.height()) / 2;
 
     log::info!("Writing \"{}\" character by character", text);
 
     for (i, ch) in text.chars().enumerate() {
-        let x = (x_start + i * char_w) as u8;
+        let x = x_start + i as u16 * font.width();
         log::info!("  '{}' at ({}, {})", ch, x, y);
-        epd.draw_char(x, y, ch).unwrap();
+        epd.draw_glyph(x, y, font, ch);
         // Block until this character's refresh completes before the next one.
         while !epd.try_flush().unwrap() {
             sleep(Duration::from_millis(1));

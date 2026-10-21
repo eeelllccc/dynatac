@@ -33,13 +33,15 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 use dynatac_core::modem::Modem;
 use i2c_bus::I2cBus;
 use keyboard::Keyboard;
 use modem::EspA7682EModem;
 
 const KEYBOARD_ADDR: u8 = 0x34;
-const ROW_HEIGHT: u16 = 10;
+const FONT: FontSize = FontSize::Medium;
+const ROW_HEIGHT: u16 = FONT.height();
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -148,10 +150,8 @@ fn main() {
 
 fn print_line(epd: &mut Epd, text: &str, y: &mut u16) {
     if *y >= display::HEIGHT { return; }
-    epd.clear_line(*y);
-    for (i, ch) in text.chars().take(30).enumerate() {
-        epd.draw_char((i * 8) as u8, *y, ch).unwrap();
-    }
+    epd.clear_line(*y, ROW_HEIGHT);
+    epd.draw_text(0, *y, FONT.font(), text);
     let _ = epd.try_flush();
     *y += ROW_HEIGHT;
 }
