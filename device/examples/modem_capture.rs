@@ -59,6 +59,7 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 use dynatac_core::battery::{BQ27220_ADDR, REG_VOLTAGE};
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::modem::at::{classify, AtEvent, AtParser, LineClass};
@@ -66,14 +67,17 @@ use dynatac_core::modem::sms_pdu;
 use dynatac_core::modem::trace::{Direction, TraceRecord};
 use dynatac_core::modem::transport::{Rx, RxReader};
 use dynatac_core::terminal::{Terminal, TerminalAction};
+use dynatac_core::geometry::Rect;
+use dynatac_core::surface::Surface;
+use dynatac_core::text_grid::TextGrid;
 use i2c_bus::{I2cBus, I2cDevice};
 use keyboard::Keyboard;
 use modem_transport::{write_all, UartTransport};
 
 const KEYBOARD_ADDR: u8 = 0x34;
-const ROW_HEIGHT: u16 = 10;
-const COLS: usize = 30;
-const ROWS: usize = (display::HEIGHT / ROW_HEIGHT) as usize;
+const FONT: FontSize = FontSize::Medium;
+const COLS: usize = (display::WIDTH / FONT.width()) as usize;
+const ROWS: usize = (display::HEIGHT / FONT.height()) as usize;
 const RX_PIPE: usize = 16 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(300);
@@ -299,12 +303,8 @@ fn hard_cut(power_en: &mut Pwr, pwrkey: &mut Pwr, start: Instant) {
 }
 
 fn render(epd: &mut Epd, term: &Terminal) {
-    for row in 0..ROWS {
-        epd.clear_line(row as u16 * ROW_HEIGHT);
-    }
-    for cell in term.render() {
-        let _ = epd.draw_char(cell.col * 8, cell.row as u16 * ROW_HEIGHT, cell.ch);
-    }
+    let mut screen = Surface::new(&mut epd.fb, Rect::SCREEN);
+    TextGrid::for_surface(FONT, &screen).draw_cells(&mut screen, &term.render());
     let _ = epd.try_flush();
 }
 

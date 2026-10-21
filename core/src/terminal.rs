@@ -6,7 +6,7 @@
 //   - Prompt display
 //
 // Pure logic — no hardware deps. The caller maps RenderCells to
-// FrameBuffer::draw_char calls.
+// pixels with `TextGrid::draw_cells`.
 //
 // Caller invariants:
 //   - Call `handle_key` for each KeyEvent from the keyboard

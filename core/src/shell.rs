@@ -57,7 +57,12 @@ impl Shell {
     pub fn new() -> Self {
         Self {
             interactive: None,
-            display_rows: crate::framebuffer::HEIGHT as usize / 8,
+            display_rows: crate::text_grid::TextGrid::new(
+                crate::font::FontSize::default(),
+                crate::screen::LAYOUT.body.w,
+                crate::screen::LAYOUT.body.h,
+            )
+            .rows(),
         }
     }
 

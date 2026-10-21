@@ -29,12 +29,17 @@ use charger::Charger;
 use display::Epd;
 use dynatac_core::battery::BQ27220_ADDR;
 use dynatac_core::charger::{ChargerDriver, BQ25896_ADDR};
+use dynatac_core::font::FontSize;
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::modem::Modem;
 use dynatac_core::power::{Power, PowerAction};
 use dynatac_core::programs::ExecContext;
+use dynatac_core::screen::LAYOUT;
 use dynatac_core::shell::{Shell, ShellAction};
+use dynatac_core::status_bar;
+use dynatac_core::surface::Surface;
 use dynatac_core::terminal::{Terminal, TerminalAction};
+use dynatac_core::text_grid::TextGrid;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use http::EspHttpClient;
@@ -49,12 +54,13 @@ use keyboard::Keyboard;
 /// TCA8418 keyboard I2C address.
 const KEYBOARD_ADDR: u8 = 0x34;
 
-/// Row height in pixels: 8px font + 2px gap.
-const ROW_HEIGHT: u16 = 10;
-/// Number of text columns (240px / 8px per glyph).
-const TERM_COLS: usize = (display::WIDTH as usize) / 8;
-/// Number of text rows (320px / 10px per row).
-const TERM_ROWS: usize = (display::HEIGHT as usize) / ROW_HEIGHT as usize;
+/// Font size for the main terminal.
+const TERM_FONT: FontSize = FontSize::Medium;
+
+/// The character grid the terminal is drawn on: the body zone.
+fn term_grid() -> TextGrid {
+    TextGrid::new(TERM_FONT, LAYOUT.body.w, LAYOUT.body.h)
+}
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -207,10 +213,12 @@ fn main() {
     // --- Init display + terminal + shell -----------------------------------------
     log::info!("Clearing display");
     epd.clear().unwrap();
+    render_status_bar(&mut epd);
 
-    let mut term = Terminal::new("> ", TERM_COLS, TERM_ROWS);
+    let grid = term_grid();
+    let mut term = Terminal::new("> ", grid.cols(), grid.rows());
     let mut shell = Shell::new();
-    shell.set_display_rows(TERM_ROWS);
+    shell.set_display_rows(grid.rows());
     let mut power = Power::new();
     let boot = std::time::Instant::now();
 
@@ -690,20 +698,21 @@ fn handle_unlock(epd: &mut Epd, term: &Terminal) {
     if let Err(e) = epd.clear() {
         log::warn!("EPD clear after unlock failed: {:?}", e);
     }
+    render_status_bar(epd);
     render_terminal(epd, term);
     flush(epd);
 }
 
-/// Render the full terminal state to the EPD framebuffer.
+/// Paint the status bar zone. Needed after anything that clears the
+/// whole framebuffer (`epd.clear()`).
+fn render_status_bar(epd: &mut Epd) {
+    status_bar::render(&mut Surface::new(&mut epd.fb, LAYOUT.status_bar));
+}
+
+/// Render the full terminal state into the body zone.
 fn render_terminal(epd: &mut Epd, term: &Terminal) {
-    for row in 0..TERM_ROWS {
-        epd.clear_line((row as u16) * ROW_HEIGHT);
-    }
-    for cell in term.render() {
-        let x = cell.col * 8;
-        let y = cell.row as u16 * ROW_HEIGHT;
-        epd.draw_char(x, y, cell.ch).unwrap();
-    }
+    let mut body = Surface::new(&mut epd.fb, LAYOUT.body);
+    term_grid().draw_cells(&mut body, &term.render());
 }
 
 /// Flush dirty regions to the e-paper display.

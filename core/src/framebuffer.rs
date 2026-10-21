@@ -4,136 +4,30 @@
 //   - `desired`   — what we want on screen (updated instantly by draw calls)
 //   - `committed` — what is physically on the display
 //
-// Call `draw_char` / `clear_line` to update `desired`, then call
-// `take_dirty_region` to get the minimal changed rectangle for flushing
-// to hardware.
+// Call `draw_glyph` / `draw_text` / `fill_rect` / `clear_line` to update
+// `desired`, then call `take_dirty_region` to get the minimal changed
+// rectangle for flushing to hardware.
 //
 // Callee invariants:
 //   - `committed` always mirrors what was last flushed to the physical display.
 //   - `desired` holds what we want on screen; `take_dirty_region` computes the diff.
+//   - The dirty region is always 8-pixel aligned horizontally, whatever
+//     pixel coordinates were drawn to.
+
+use crate::font::Font;
+use crate::geometry::Rect;
+
+/// Pixel colour on the 1-bit panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    Black,
+    White,
+}
 
 pub const WIDTH: u16 = 240;
 pub const HEIGHT: u16 = 320;
 pub const BYTES_PER_ROW: usize = WIDTH as usize / 8; // 30
 pub const BUF_LEN: usize = BYTES_PER_ROW * HEIGHT as usize; // 9600
-
-// --- 8×8 bitmap font ----------------------------------------------------------
-//
-// Indexed by (ASCII code − 0x20), covering 0x20..=0x7F (96 characters).
-// Each entry is 8 bytes, one per pixel row top-to-bottom.
-// Within each byte: bit 7 = leftmost pixel, 1 = black, 0 = white.
-
-#[rustfmt::skip]
-const FONT_8X8: [[u8; 8]; 96] = [
-  /* 0x20 ' '  */ [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
-  /* 0x21 '!'  */ [0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00],
-  /* 0x22 '"'  */ [0x66,0x66,0x44,0x00,0x00,0x00,0x00,0x00],
-  /* 0x23 '#'  */ [0x24,0x7E,0x24,0x24,0x7E,0x24,0x00,0x00],
-  /* 0x24 '$'  */ [0x08,0x3E,0x48,0x3C,0x0A,0x7C,0x08,0x00],
-  /* 0x25 '%'  */ [0x62,0x64,0x08,0x10,0x26,0x46,0x00,0x00],
-  /* 0x26 '&'  */ [0x38,0x44,0x48,0x30,0x4A,0x44,0x3A,0x00],
-  /* 0x27 '\'' */ [0x18,0x18,0x10,0x00,0x00,0x00,0x00,0x00],
-  /* 0x28 '('  */ [0x08,0x10,0x20,0x20,0x20,0x10,0x08,0x00],
-  /* 0x29 ')'  */ [0x20,0x10,0x08,0x08,0x08,0x10,0x20,0x00],
-  /* 0x2A '*'  */ [0x00,0x14,0x08,0x3E,0x08,0x14,0x00,0x00],
-  /* 0x2B '+'  */ [0x00,0x08,0x08,0x3E,0x08,0x08,0x00,0x00],
-  /* 0x2C ','  */ [0x00,0x00,0x00,0x00,0x18,0x18,0x10,0x00],
-  /* 0x2D '-'  */ [0x00,0x00,0x00,0x3E,0x00,0x00,0x00,0x00],
-  /* 0x2E '.'  */ [0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00],
-  /* 0x2F '/'  */ [0x02,0x04,0x08,0x10,0x20,0x40,0x00,0x00],
-  /* 0x30 '0'  */ [0x3C,0x46,0x4A,0x52,0x62,0x3C,0x00,0x00],
-  /* 0x31 '1'  */ [0x18,0x28,0x08,0x08,0x08,0x3E,0x00,0x00],
-  /* 0x32 '2'  */ [0x3C,0x42,0x02,0x1C,0x20,0x7E,0x00,0x00],
-  /* 0x33 '3'  */ [0x3C,0x42,0x0C,0x02,0x42,0x3C,0x00,0x00],
-  /* 0x34 '4'  */ [0x08,0x18,0x28,0x48,0x7E,0x08,0x00,0x00],
-  /* 0x35 '5'  */ [0x7E,0x40,0x7C,0x02,0x42,0x3C,0x00,0x00],
-  /* 0x36 '6'  */ [0x3C,0x40,0x7C,0x42,0x42,0x3C,0x00,0x00],
-  /* 0x37 '7'  */ [0x7E,0x04,0x08,0x10,0x10,0x10,0x00,0x00],
-  /* 0x38 '8'  */ [0x3C,0x42,0x3C,0x42,0x42,0x3C,0x00,0x00],
-  /* 0x39 '9'  */ [0x3C,0x42,0x3E,0x02,0x42,0x3C,0x00,0x00],
-  /* 0x3A ':'  */ [0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x00],
-  /* 0x3B ';'  */ [0x00,0x18,0x18,0x00,0x18,0x18,0x10,0x00],
-  /* 0x3C '<'  */ [0x08,0x10,0x20,0x40,0x20,0x10,0x08,0x00],
-  /* 0x3D '='  */ [0x00,0x00,0x7E,0x00,0x7E,0x00,0x00,0x00],
-  /* 0x3E '>'  */ [0x20,0x10,0x08,0x04,0x08,0x10,0x20,0x00],
-  /* 0x3F '?'  */ [0x3C,0x42,0x04,0x18,0x00,0x18,0x00,0x00],
-  /* 0x40 '@'  */ [0x3C,0x42,0x5A,0x56,0x5C,0x40,0x3C,0x00],
-  /* 0x41 'A'  */ [0x18,0x24,0x42,0x7E,0x42,0x42,0x00,0x00],
-  /* 0x42 'B'  */ [0x7C,0x42,0x7C,0x42,0x42,0x7C,0x00,0x00],
-  /* 0x43 'C'  */ [0x3C,0x42,0x40,0x40,0x42,0x3C,0x00,0x00],
-  /* 0x44 'D'  */ [0x78,0x44,0x42,0x42,0x44,0x78,0x00,0x00],
-  /* 0x45 'E'  */ [0x7E,0x40,0x7C,0x40,0x40,0x7E,0x00,0x00],
-  /* 0x46 'F'  */ [0x7E,0x40,0x7C,0x40,0x40,0x40,0x00,0x00],
-  /* 0x47 'G'  */ [0x3C,0x40,0x40,0x4E,0x42,0x3C,0x00,0x00],
-  /* 0x48 'H'  */ [0x42,0x42,0x42,0x7E,0x42,0x42,0x42,0x00],
-  /* 0x49 'I'  */ [0x3E,0x08,0x08,0x08,0x08,0x3E,0x00,0x00],
-  /* 0x4A 'J'  */ [0x02,0x02,0x02,0x42,0x42,0x3C,0x00,0x00],
-  /* 0x4B 'K'  */ [0x42,0x44,0x78,0x48,0x44,0x42,0x00,0x00],
-  /* 0x4C 'L'  */ [0x40,0x40,0x40,0x40,0x40,0x7E,0x00,0x00],
-  /* 0x4D 'M'  */ [0x42,0x66,0x5A,0x42,0x42,0x42,0x00,0x00],
-  /* 0x4E 'N'  */ [0x42,0x62,0x52,0x4A,0x46,0x42,0x00,0x00],
-  /* 0x4F 'O'  */ [0x3C,0x42,0x42,0x42,0x42,0x3C,0x00,0x00],
-  /* 0x50 'P'  */ [0x7C,0x42,0x7C,0x40,0x40,0x40,0x00,0x00],
-  /* 0x51 'Q'  */ [0x3C,0x42,0x42,0x4A,0x44,0x3A,0x00,0x00],
-  /* 0x52 'R'  */ [0x7C,0x42,0x7C,0x48,0x44,0x42,0x00,0x00],
-  /* 0x53 'S'  */ [0x3C,0x40,0x3C,0x02,0x42,0x3C,0x00,0x00],
-  /* 0x54 'T'  */ [0x7E,0x08,0x08,0x08,0x08,0x08,0x00,0x00],
-  /* 0x55 'U'  */ [0x42,0x42,0x42,0x42,0x42,0x3C,0x00,0x00],
-  /* 0x56 'V'  */ [0x42,0x42,0x42,0x24,0x18,0x00,0x00,0x00],
-  /* 0x57 'W'  */ [0x41,0x41,0x41,0x49,0x55,0x63,0x00,0x00],
-  /* 0x58 'X'  */ [0x42,0x24,0x18,0x18,0x24,0x42,0x00,0x00],
-  /* 0x59 'Y'  */ [0x42,0x24,0x18,0x08,0x08,0x08,0x00,0x00],
-  /* 0x5A 'Z'  */ [0x7E,0x04,0x08,0x10,0x20,0x7E,0x00,0x00],
-  /* 0x5B '['  */ [0x1E,0x10,0x10,0x10,0x10,0x1E,0x00,0x00],
-  /* 0x5C '\\' */ [0x40,0x20,0x10,0x08,0x04,0x02,0x00,0x00],
-  /* 0x5D ']'  */ [0x3C,0x04,0x04,0x04,0x04,0x3C,0x00,0x00],
-  /* 0x5E '^'  */ [0x08,0x14,0x22,0x00,0x00,0x00,0x00,0x00],
-  /* 0x5F '_'  */ [0x00,0x00,0x00,0x00,0x00,0x00,0x7E,0x00],
-  /* 0x60 '`'  */ [0x10,0x08,0x00,0x00,0x00,0x00,0x00,0x00],
-  /* 0x61 'a'  */ [0x00,0x00,0x3C,0x02,0x3E,0x42,0x3E,0x00],
-  /* 0x62 'b'  */ [0x40,0x40,0x7C,0x42,0x42,0x7C,0x00,0x00],
-  /* 0x63 'c'  */ [0x00,0x00,0x3C,0x40,0x40,0x3C,0x00,0x00],
-  /* 0x64 'd'  */ [0x02,0x02,0x3E,0x42,0x42,0x3E,0x00,0x00],
-  /* 0x65 'e'  */ [0x00,0x00,0x3C,0x42,0x7E,0x40,0x3C,0x00],
-  /* 0x66 'f'  */ [0x1C,0x20,0x7C,0x20,0x20,0x20,0x00,0x00],
-  /* 0x67 'g'  */ [0x00,0x00,0x3E,0x42,0x3E,0x02,0x3C,0x00],
-  /* 0x68 'h'  */ [0x40,0x40,0x7C,0x42,0x42,0x42,0x00,0x00],
-  /* 0x69 'i'  */ [0x08,0x00,0x18,0x08,0x08,0x1C,0x00,0x00],
-  /* 0x6A 'j'  */ [0x02,0x00,0x06,0x02,0x42,0x3C,0x00,0x00],
-  /* 0x6B 'k'  */ [0x40,0x48,0x50,0x60,0x50,0x48,0x00,0x00],
-  /* 0x6C 'l'  */ [0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00],
-  /* 0x6D 'm'  */ [0x00,0x00,0x76,0x49,0x49,0x49,0x00,0x00],
-  /* 0x6E 'n'  */ [0x00,0x00,0x7C,0x42,0x42,0x42,0x00,0x00],
-  /* 0x6F 'o'  */ [0x00,0x00,0x3C,0x42,0x42,0x42,0x3C,0x00],
-  /* 0x70 'p'  */ [0x00,0x00,0x7C,0x42,0x7C,0x40,0x40,0x00],
-  /* 0x71 'q'  */ [0x00,0x00,0x3E,0x42,0x3E,0x02,0x02,0x00],
-  /* 0x72 'r'  */ [0x00,0x00,0x7C,0x40,0x40,0x40,0x00,0x00],
-  /* 0x73 's'  */ [0x00,0x00,0x3C,0x40,0x3C,0x02,0x7C,0x00],
-  /* 0x74 't'  */ [0x20,0x20,0x7C,0x20,0x20,0x1C,0x00,0x00],
-  /* 0x75 'u'  */ [0x00,0x00,0x42,0x42,0x42,0x3E,0x00,0x00],
-  /* 0x76 'v'  */ [0x00,0x00,0x42,0x42,0x24,0x18,0x00,0x00],
-  /* 0x77 'w'  */ [0x00,0x00,0x41,0x49,0x55,0x22,0x00,0x00],
-  /* 0x78 'x'  */ [0x00,0x00,0x42,0x24,0x18,0x24,0x42,0x00],
-  /* 0x79 'y'  */ [0x00,0x00,0x42,0x42,0x3E,0x02,0x3C,0x00],
-  /* 0x7A 'z'  */ [0x00,0x00,0x7E,0x0C,0x30,0x7E,0x00,0x00],
-  /* 0x7B '{'  */ [0x0E,0x08,0x30,0x08,0x08,0x0E,0x00,0x00],
-  /* 0x7C '|'  */ [0x08,0x08,0x08,0x08,0x08,0x08,0x00,0x00],
-  /* 0x7D '}'  */ [0x38,0x08,0x06,0x08,0x08,0x38,0x00,0x00],
-  /* 0x7E '~'  */ [0x30,0x49,0x06,0x00,0x00,0x00,0x00,0x00],
-  /* 0x7F DEL  */ [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00],
-];
-
-/// Look up the 8×8 glyph for an ASCII character. Returns 8 rows, each
-/// a byte where bit 7 is the leftmost pixel and 1 means black. Returns
-/// `None` for characters outside `0x20..=0x7F`.
-pub fn glyph_8x8(ch: char) -> Option<[u8; 8]> {
-    let code = ch as usize;
-    if (0x20..=0x7F).contains(&code) {
-        Some(FONT_8X8[code - 0x20])
-    } else {
-        None
-    }
-}
 
 /// The region that changed since the last flush.
 ///
@@ -154,7 +48,7 @@ pub struct DirtyRegion {
 ///   - `desired`   — what we want on screen (updated instantly by draw calls)
 ///   - `committed` — what is physically on the display (mirrors controller state)
 ///
-/// Call `draw_char` / `clear_line` to update `desired`, then call
+/// Call `draw_glyph` / `draw_text` / `clear_line` to update `desired`, then call
 /// `take_dirty_region` to extract the changed rectangle for hardware flushing.
 pub struct FrameBuffer {
     /// What we want on screen.
@@ -184,27 +78,56 @@ impl FrameBuffer {
         self.dirty = None;
     }
 
-    /// Draw a character into the `desired` buffer at pixel position (x, y).
+    /// Draw one character cell with its top-left corner at pixel (x, y).
     ///
-    /// Caller invariants:
-    ///   - `x` must be a multiple of 8.
-    ///   - `y + 8` must not exceed HEIGHT (320).
-    ///   - `ch` must be an ASCII character in the range 0x20..=0x7F.
-    pub fn draw_char(&mut self, x: u8, y: u16, ch: char) {
-        let code = ch as usize;
-        if !(0x20..=0x7F).contains(&code) {
+    /// The whole `font.width() × font.height()` cell is painted: glyph
+    /// pixels black, the rest white, so drawing over old text replaces it.
+    /// `x` need not be aligned. Pixels falling outside the display are
+    /// clipped. Characters the font lacks draw as the replacement glyph.
+    pub fn draw_glyph(&mut self, x: u16, y: u16, font: &Font, ch: char) {
+        self.draw_glyph_clipped(x, y, font, ch, Ink::Black, Rect::SCREEN);
+    }
+
+    /// Like `draw_glyph`, but glyph pixels are drawn in `ink` (the cell
+    /// background in the opposite colour), and only pixels inside `clip`
+    /// are touched.
+    pub fn draw_glyph_clipped(
+        &mut self,
+        x: u16,
+        y: u16,
+        font: &Font,
+        ch: char,
+        ink: Ink,
+        clip: Rect,
+    ) {
+        let glyph = font.glyph(ch);
+        let cell = Rect::new(x, y, glyph.width, glyph.height);
+        let area = cell.intersect(&clip).intersect(&Rect::SCREEN);
+        if area.is_empty() {
             return;
         }
-        let glyph = &FONT_8X8[code - 0x20];
-        let byte_col = (x as usize) / 8;
-
-        for row in 0..8usize {
-            let idx = (y as usize + row) * BYTES_PER_ROW + byte_col;
-            if idx < BUF_LEN {
-                self.desired[idx] = !glyph[row];
+        let black = ink == Ink::Black;
+        for py in area.y..area.bottom() {
+            for px in area.x..area.right() {
+                self.set_pixel(px, py, glyph.is_set(px - x, py - y) == black);
             }
         }
-        self.mark_dirty(x as u16 & 0xFFF8, y, 8, 8);
+        self.mark_dirty_unaligned(area.x, area.y, area.right(), area.bottom());
+    }
+
+    /// Draw `text` left to right starting at pixel (x, y), one cell per
+    /// `char`. Stops at the first character whose cell would not fit
+    /// entirely on the display. Returns the x just past the last cell drawn.
+    pub fn draw_text(&mut self, x: u16, y: u16, font: &Font, text: &str) -> u16 {
+        let mut cx = x;
+        for ch in text.chars() {
+            if cx + font.width() > WIDTH {
+                break;
+            }
+            self.draw_glyph(cx, y, font, ch);
+            cx += font.width();
+        }
+        cx
     }
 
     /// Fill an axis-aligned rectangle in the desired buffer.
@@ -216,23 +139,14 @@ impl FrameBuffer {
         if w == 0 || h == 0 || x >= WIDTH || y >= HEIGHT {
             return;
         }
-        let x_end = (x + w).min(WIDTH);
-        let y_end = (y + h).min(HEIGHT);
+        let x_end = x.saturating_add(w).min(WIDTH);
+        let y_end = y.saturating_add(h).min(HEIGHT);
         for py in y..y_end {
             for px in x..x_end {
-                let byte_idx = (py as usize) * BYTES_PER_ROW + (px as usize / 8);
-                let bit = 7 - (px % 8) as u8;
-                if on {
-                    self.desired[byte_idx] &= !(1u8 << bit); // black
-                } else {
-                    self.desired[byte_idx] |= 1u8 << bit;    // white
-                }
+                self.set_pixel(px, py, on);
             }
         }
-        // Expand dirty bbox to 8-aligned bytes for partial-flush safety.
-        let aligned_x = x & 0xFFF8;
-        let aligned_w = ((x_end - aligned_x + 7) & 0xFFF8).max(8);
-        self.mark_dirty(aligned_x, y, aligned_w, y_end - y);
+        self.mark_dirty_unaligned(x, y, x_end, y_end);
     }
 
     /// Clear the entire desired buffer to white. Marks the full display
@@ -242,12 +156,9 @@ impl FrameBuffer {
         self.mark_dirty(0, 0, WIDTH, HEIGHT);
     }
 
-    /// Clear the 8-pixel-tall strip at row `y` across the full display width.
-    pub fn clear_line(&mut self, y: u16) {
-        let start = y as usize * BYTES_PER_ROW;
-        let end = start + BYTES_PER_ROW * 8;
-        self.desired[start..end].fill(0xFF);
-        self.mark_dirty(0, y, WIDTH, 8);
+    /// Clear the full-width strip of `height` pixel rows starting at `y`.
+    pub fn clear_line(&mut self, y: u16, height: u16) {
+        self.fill_rect(0, y, WIDTH, height, false);
     }
 
     /// Take the dirty region, if any. Returns the bounding rectangle and pixel
@@ -291,6 +202,24 @@ impl FrameBuffer {
 
     // --- Internal helpers --------------------------------------------------------
 
+    /// Set one pixel in `desired`. `on` = black. Caller ensures it's on screen.
+    fn set_pixel(&mut self, x: u16, y: u16, on: bool) {
+        let idx = y as usize * BYTES_PER_ROW + x as usize / 8;
+        let bit = 0x80u8 >> (x % 8);
+        if on {
+            self.desired[idx] &= !bit;
+        } else {
+            self.desired[idx] |= bit;
+        }
+    }
+
+    /// Mark the pixel span [x, x_end) × [y, y_end) dirty, widened to whole bytes.
+    fn mark_dirty_unaligned(&mut self, x: u16, y: u16, x_end: u16, y_end: u16) {
+        let aligned_x = x & !7;
+        let aligned_end = (x_end + 7) & !7;
+        self.mark_dirty(aligned_x, y, aligned_end - aligned_x, y_end - y);
+    }
+
     fn mark_dirty(&mut self, x: u16, y: u16, w: u16, h: u16) {
         let (x_min, y_min, x_max, y_max) = match self.dirty {
             Some((x0, y0, x1, y1)) => (
@@ -325,6 +254,27 @@ impl Default for FrameBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::font::FontSize;
+
+    fn is_black(fb: &FrameBuffer, x: u16, y: u16) -> bool {
+        let byte = fb.desired_byte(y as usize * BYTES_PER_ROW + x as usize / 8);
+        byte & (0x80 >> (x % 8)) == 0
+    }
+
+    /// Assert the screen at (x, y) shows exactly the glyph for `ch`.
+    fn assert_glyph_at(fb: &FrameBuffer, x: u16, y: u16, size: FontSize, ch: char) {
+        let g = size.font().glyph(ch);
+        for gy in 0..g.height {
+            for gx in 0..g.width {
+                assert_eq!(
+                    is_black(fb, x + gx, y + gy),
+                    g.is_set(gx, gy),
+                    "{:?} {:?} pixel ({}, {})",
+                    size, ch, gx, gy
+                );
+            }
+        }
+    }
 
     #[test]
     fn new_framebuffer_is_all_white() {
@@ -335,109 +285,145 @@ mod tests {
     }
 
     #[test]
-    fn draw_char_writes_inverted_glyph() {
-        let mut fb = FrameBuffer::new();
-        // Draw 'A' (0x41) at position (0, 0)
-        fb.draw_char(0, 0, 'A');
-
-        // FONT_8X8['A' - ' '] = [0x18,0x24,0x42,0x7E,0x42,0x42,0x00,0x00]
-        // Stored inverted: desired[row] = !glyph[row]
-        let expected: [u8; 8] = [!0x18, !0x24, !0x42, !0x7E, !0x42, !0x42, !0x00, !0x00];
-        for row in 0..8 {
-            assert_eq!(
-                fb.desired_byte(row * BYTES_PER_ROW),
-                expected[row],
-                "row {} mismatch",
-                row
-            );
+    fn draw_glyph_paints_every_size() {
+        for size in FontSize::ALL {
+            let mut fb = FrameBuffer::new();
+            fb.draw_glyph(0, 0, size.font(), 'A');
+            assert_glyph_at(&fb, 0, 0, size, 'A');
         }
     }
 
     #[test]
-    fn draw_char_at_column_offset() {
+    fn draw_glyph_at_unaligned_x() {
+        // Small glyphs are 6 wide, so the third cell starts at x=12,
+        // straddling bytes 1 and 2.
         let mut fb = FrameBuffer::new();
-        // Draw 'B' at x=16 (byte column 2), y=0
-        fb.draw_char(16, 0, 'B');
-
-        let glyph = FONT_8X8['B' as usize - 0x20];
-        for row in 0..8 {
-            // byte_col = 16/8 = 2
-            assert_eq!(
-                fb.desired_byte(row * BYTES_PER_ROW + 2),
-                !glyph[row],
-                "row {} mismatch",
-                row
-            );
-            // Column 0 should be untouched (white)
-            assert_eq!(fb.desired_byte(row * BYTES_PER_ROW), 0xFF);
+        fb.draw_glyph(12, 5, FontSize::Small.font(), 'M');
+        assert_glyph_at(&fb, 12, 5, FontSize::Small, 'M');
+        // Neighbouring pixels are untouched.
+        for y in 5..17 {
+            assert!(!is_black(&fb, 11, y));
+            assert!(!is_black(&fb, 18, y));
         }
     }
 
     #[test]
-    fn draw_char_ignores_non_ascii() {
+    fn draw_glyph_replaces_previous_cell_contents() {
         let mut fb = FrameBuffer::new();
-        fb.draw_char(0, 0, '\u{80}'); // outside 0x20..=0x7F
-        assert!(!fb.is_dirty());
-        assert_eq!(fb.desired_byte(0), 0xFF);
+        let font = FontSize::Medium.font();
+        fb.draw_glyph(8, 0, font, '#');
+        fb.draw_glyph(8, 0, font, '.');
+        assert_glyph_at(&fb, 8, 0, FontSize::Medium, '.');
+        fb.draw_glyph(8, 0, font, ' ');
+        assert!(!fb.desired.iter().any(|&b| b != 0xFF), "space erases the cell");
     }
 
     #[test]
-    fn clear_line_zeroes_strip() {
+    fn draw_glyph_uses_replacement_for_unknown_chars() {
         let mut fb = FrameBuffer::new();
-        // Draw something at y=0 first
-        fb.draw_char(0, 0, 'X');
-        assert_ne!(fb.desired_byte(0), 0xFF);
+        fb.draw_glyph(0, 0, FontSize::Medium.font(), '😀');
+        assert_glyph_at(&fb, 0, 0, FontSize::Medium, crate::font::REPLACEMENT);
+    }
 
-        // Clear line at y=0
-        fb.clear_line(0);
-        for col in 0..BYTES_PER_ROW {
-            for row in 0..8 {
-                assert_eq!(
-                    fb.desired_byte(row * BYTES_PER_ROW + col),
-                    0xFF,
-                    "byte at row={} col={} not white after clear_line",
-                    row,
-                    col
-                );
+    #[test]
+    fn draw_glyph_clips_at_display_edges() {
+        let mut fb = FrameBuffer::new();
+        let font = FontSize::Large.font();
+        fb.draw_glyph(WIDTH - 4, HEIGHT - 4, font, '#'); // mostly off screen
+        fb.draw_glyph(WIDTH, 0, font, '#'); // entirely off screen
+        let r = fb.take_dirty_region().unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (WIDTH - 8, HEIGHT - 4, 8, 4));
+    }
+
+    #[test]
+    fn draw_glyph_clipped_white_ink_inverts_cell() {
+        let mut fb = FrameBuffer::new();
+        let font = FontSize::Small.font();
+        fb.draw_glyph_clipped(0, 0, font, 'A', Ink::White, Rect::SCREEN);
+        let g = font.glyph('A');
+        for y in 0..g.height {
+            for x in 0..g.width {
+                assert_eq!(is_black(&fb, x, y), !g.is_set(x, y), "({}, {})", x, y);
             }
         }
     }
 
     #[test]
-    fn dirty_tracking_single_char() {
+    fn draw_glyph_clipped_touches_only_clip_area() {
         let mut fb = FrameBuffer::new();
-        assert!(!fb.is_dirty());
+        let font = FontSize::Large.font();
+        // Clip to the left 5 columns and top 3 rows of the cell at (8, 8).
+        let clip = Rect::new(8, 8, 5, 3);
+        fb.draw_glyph_clipped(8, 8, font, '#', Ink::White, clip);
+        for y in 0..40 {
+            for x in 0..40 {
+                if !(8..13).contains(&x) || !(8..11).contains(&y) {
+                    assert!(!is_black(&fb, x, y), "outside clip at ({}, {})", x, y);
+                }
+            }
+        }
+        let r = fb.take_dirty_region().unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (8, 8, 8, 3));
+    }
 
-        fb.draw_char(16, 100, 'Z');
-        assert!(fb.is_dirty());
+    #[test]
+    fn draw_text_advances_by_cell_width_and_returns_end() {
+        let mut fb = FrameBuffer::new();
+        let end = fb.draw_text(3, 10, FontSize::Small.font(), "Hi!");
+        assert_eq!(end, 3 + 3 * 6);
+        assert_glyph_at(&fb, 3, 10, FontSize::Small, 'H');
+        assert_glyph_at(&fb, 9, 10, FontSize::Small, 'i');
+        assert_glyph_at(&fb, 15, 10, FontSize::Small, '!');
+    }
 
-        let region = fb.take_dirty_region().unwrap();
-        assert_eq!(region.x, 16);
-        assert_eq!(region.y, 100);
-        assert_eq!(region.w, 8);
-        assert_eq!(region.h, 8);
-        assert_eq!(region.data.len(), 1 * 8); // 1 byte wide × 8 rows
+    #[test]
+    fn draw_text_stops_before_a_cell_that_would_not_fit() {
+        let mut fb = FrameBuffer::new();
+        let font = FontSize::Large.font(); // 20 cells across
+        let end = fb.draw_text(0, 0, font, &"W".repeat(25));
+        assert_eq!(end, 240);
+        let mut fb2 = FrameBuffer::new();
+        assert_eq!(fb2.draw_text(234, 0, font, "W"), 234, "half a cell left: nothing drawn");
+        assert!(!fb2.is_dirty());
+    }
+
+    #[test]
+    fn clear_line_whitens_strip_of_given_height() {
+        let mut fb = FrameBuffer::new();
+        fb.fill_rect(0, 0, WIDTH, 30, true);
+        fb.clear_line(10, 14);
+        for y in 0..30 {
+            let expect_black = !(10..24).contains(&y);
+            assert_eq!(is_black(&fb, 0, y), expect_black, "y={}", y);
+            assert_eq!(is_black(&fb, WIDTH - 1, y), expect_black, "y={}", y);
+        }
+    }
+
+    #[test]
+    fn dirty_region_of_unaligned_glyph_is_byte_aligned() {
+        let mut fb = FrameBuffer::new();
+        fb.draw_glyph(12, 100, FontSize::Small.font(), 'Z'); // pixels 12..18
+        let r = fb.take_dirty_region().unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (8, 100, 16, 12));
+        assert_eq!(r.data.len(), 2 * 12);
     }
 
     #[test]
     fn dirty_tracking_merges_regions() {
         let mut fb = FrameBuffer::new();
-        fb.draw_char(0, 0, 'A');
-        fb.draw_char(16, 0, 'B');
+        let font = FontSize::Medium.font();
+        fb.draw_glyph(0, 0, font, 'A');
+        fb.draw_glyph(16, 0, font, 'B');
 
-        let region = fb.take_dirty_region().unwrap();
-        // Should merge: x_min=0, x_max=24, y_min=0, y_max=8
-        assert_eq!(region.x, 0);
-        assert_eq!(region.y, 0);
-        assert_eq!(region.w, 24);
-        assert_eq!(region.h, 8);
-        assert_eq!(region.data.len(), 3 * 8); // 3 bytes wide × 8 rows
+        let r = fb.take_dirty_region().unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 24, 14));
+        assert_eq!(r.data.len(), 3 * 14);
     }
 
     #[test]
     fn take_dirty_region_clears_dirty() {
         let mut fb = FrameBuffer::new();
-        fb.draw_char(0, 0, 'A');
+        fb.draw_glyph(0, 0, FontSize::Medium.font(), 'A');
         let _ = fb.take_dirty_region();
 
         assert!(!fb.is_dirty());
@@ -447,24 +433,18 @@ mod tests {
     #[test]
     fn take_dirty_region_updates_committed() {
         let mut fb = FrameBuffer::new();
-        fb.draw_char(0, 0, 'A');
+        fb.draw_glyph(0, 0, FontSize::Medium.font(), 'A');
         let _ = fb.take_dirty_region();
 
-        // After flush, committed should match desired at (0,0)
-        for row in 0..8 {
-            assert_eq!(
-                fb.desired_byte(row * BYTES_PER_ROW),
-                fb.committed_byte(row * BYTES_PER_ROW),
-                "committed != desired at row {}",
-                row
-            );
+        for i in 0..14 * BYTES_PER_ROW {
+            assert_eq!(fb.desired_byte(i), fb.committed_byte(i), "byte {}", i);
         }
     }
 
     #[test]
     fn clear_resets_everything() {
         let mut fb = FrameBuffer::new();
-        fb.draw_char(0, 0, 'X');
+        fb.draw_glyph(0, 0, FontSize::Medium.font(), 'X');
         fb.clear();
 
         assert!(!fb.is_dirty());
@@ -473,14 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn draw_char_near_bottom_edge() {
+    fn draw_glyph_flush_with_bottom_edge() {
         let mut fb = FrameBuffer::new();
-        // Last valid y position for 8px tall char
-        fb.draw_char(0, HEIGHT - 8, '!');
-        assert!(fb.is_dirty());
-
-        let region = fb.take_dirty_region().unwrap();
-        assert_eq!(region.y, HEIGHT - 8);
-        assert_eq!(region.h, 8);
+        fb.draw_glyph(0, HEIGHT - 24, FontSize::Large.font(), '!');
+        let r = fb.take_dirty_region().unwrap();
+        assert_eq!((r.y, r.h), (HEIGHT - 24, 24));
     }
 }

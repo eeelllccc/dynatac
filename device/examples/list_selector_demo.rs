@@ -26,17 +26,18 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use dynatac_core::font::FontSize;
 use dynatac_core::keymap::KeyEvent;
 use dynatac_core::list_selector::{ListAction, ListSelector};
 use i2c_bus::I2cBus;
 use keyboard::Keyboard;
 
 const KEYBOARD_ADDR: u8 = 0x34;
-const CHAR_W: usize = 8;
-const CHAR_H: u16 = 8;
+const FONT: FontSize = FontSize::Medium;
+const CHAR_W: usize = FONT.width() as usize;
+const CHAR_H: u16 = FONT.height();
 const COLS: usize = display::WIDTH as usize / CHAR_W;
-/// Visible rows at the default 8×8 font. Update this (or derive it
-/// dynamically) when font-size support is added.
+/// Visible rows at `FONT`.
 const DISPLAY_ROWS: usize = display::HEIGHT as usize / CHAR_H as usize;
 
 enum Screen {
@@ -169,7 +170,7 @@ fn render(epd: &mut Epd, screen: &Screen) {
 fn clear_display(epd: &mut Epd) {
     let mut y = 0u16;
     while y < display::HEIGHT {
-        epd.clear_line(y);
+        epd.clear_line(y, CHAR_H);
         y += CHAR_H;
     }
 }
@@ -181,6 +182,6 @@ fn draw_row(epd: &mut Epd, row: usize, text: &str) {
     let chars: Vec<char> = text.chars().collect();
     for col in 0..COLS {
         let ch = chars.get(col).copied().unwrap_or(' ');
-        epd.draw_char((col * CHAR_W) as u8, y, ch).unwrap();
+        epd.draw_glyph((col * CHAR_W) as u16, y, FONT.font(), ch);
     }
 }
