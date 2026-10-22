@@ -92,8 +92,8 @@ impl<'d> Epd<'d> {
     }
 
     fn wait_busy(&self) {
-        // 10 ms >= one FreeRTOS tick (portTICK_PERIOD_MS=10), so usleep()
-        // calls vTaskDelay(1) instead of busy-waiting with esp_rom_delay_us.
+        // 10 ms >= one FreeRTOS tick, so usleep() calls vTaskDelay instead
+        // of busy-waiting with esp_rom_delay_us.
         // This keeps the IDLE task alive and prevents the task watchdog from
         // firing during long full-panel refreshes (which can take >5 s).
         sleep(Duration::from_millis(10));

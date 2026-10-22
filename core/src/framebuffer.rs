@@ -5,14 +5,29 @@
 //   - `committed` — what is physically on the display
 //
 // Call `draw_glyph` / `draw_text` / `fill_rect` / `clear_line` to update
-// `desired`, then call `take_dirty_region` to get the minimal changed
-// rectangle for flushing to hardware.
+// `desired`, then flush in two steps (the kernel's side of the spi task):
+//   - `begin_flush` gives what to send: `Flush::Full` while the panel's
+//     contents are unknown (at boot: the e-paper keeps its old image; after
+//     a failed draw), else `Flush::Partial` with the smallest byte-aligned
+//     rectangle where `desired` differs from `committed`, or `None` if
+//     nothing differs.
+//   - `end_flush(ok)` once the draw has finished: `committed` takes the sent
+//     data only if `ok`; otherwise the contents become unknown.
+// Drawing may continue while a flush is in flight; the next flush covers it.
 //
 // Callee invariants:
-//   - `committed` always mirrors what was last flushed to the physical display.
-//   - `desired` holds what we want on screen; `take_dirty_region` computes the diff.
-//   - The dirty region is always 8-pixel aligned horizontally, whatever
-//     pixel coordinates were drawn to.
+//   - `committed` changes only on `end_flush(true)`, so it never claims
+//     more than the panel was told to show.
+//   - A partial region is 8-pixel aligned horizontally and tight: its edge
+//     rows and byte columns each contain a changed byte.
+//   - Drawing the same pixels again doesn't cause a flush.
+//
+// Caller invariants:
+//   - At most one flush in flight: `end_flush` exactly once after each
+//     `begin_flush` that returned `Some`, before the next `begin_flush`.
+//
+// `take_dirty_region` is the old one-step API (commits immediately), kept
+// for `device/src/display.rs` until the kernel loop replaces it.
 
 use crate::font::Font;
 use crate::geometry::Rect;
@@ -34,6 +49,7 @@ pub const BUF_LEN: usize = BYTES_PER_ROW * HEIGHT as usize; // 9600
 /// `x`, `y`, `w`, `h` are in pixels (x and w are multiples of 8).
 /// `data` contains the new pixel bytes for this region, row by row,
 /// ready to be written to the display controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyRegion {
     pub x: u16,
     pub y: u16,
@@ -56,8 +72,19 @@ pub struct FrameBuffer {
     /// What the display currently shows.
     committed: Box<[u8; BUF_LEN]>,
     /// Dirty bounding box: (x_min, y_min, x_max, y_max) in pixels, 8-aligned.
-    /// `None` means desired == committed.
+    /// `None` means nothing was drawn since the last flush began.
     dirty: Option<(u16, u16, u16, u16)>,
+    /// `committed` is what the panel shows (false at boot: unknown).
+    known: bool,
+    in_flight: Option<Flush>,
+}
+
+/// What to send to the panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flush {
+    /// The whole screen, `BUF_LEN` bytes.
+    Full(Vec<u8>),
+    Partial(DirtyRegion),
 }
 
 impl FrameBuffer {
@@ -67,6 +94,91 @@ impl FrameBuffer {
             desired: Box::new([0xFF; BUF_LEN]),
             committed: Box::new([0xFF; BUF_LEN]),
             dirty: None,
+            known: false,
+            in_flight: None,
+        }
+    }
+
+    /// What to send next, if anything (see the module comment).
+    pub fn begin_flush(&mut self) -> Option<Flush> {
+        debug_assert!(self.in_flight.is_none(), "begin_flush with a flush in flight");
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let flush = if self.known {
+            let (x0, y0, x1, y1) = self.dirty.take()?;
+            let (x, y, w, h) = self.changed_within(x0, y0, x1, y1)?;
+            let data = Self::extract_region(&self.desired, x, y, w, h);
+            Flush::Partial(DirtyRegion { x, y, w, h, data })
+        } else {
+            self.dirty = None;
+            Flush::Full(self.desired.to_vec())
+        };
+        self.in_flight = Some(flush.clone());
+        Some(flush)
+    }
+
+    /// The flush begun last has finished; `ok` if the panel shows it.
+    pub fn end_flush(&mut self, ok: bool) {
+        let Some(flush) = self.in_flight.take() else {
+            debug_assert!(false, "end_flush with no flush in flight");
+            return;
+        };
+        if !ok {
+            self.known = false;
+            return;
+        }
+        match flush {
+            Flush::Full(data) => {
+                self.committed.copy_from_slice(&data);
+                self.known = true;
+            }
+            Flush::Partial(r) => self.write_committed(&r),
+        }
+    }
+
+    /// Forget what the panel shows: the next flush is full (clears
+    /// ghosting, e.g. after the lockscreen).
+    pub fn invalidate(&mut self) {
+        self.known = false;
+    }
+
+    /// Whether `begin_flush` may have something to send.
+    pub fn needs_flush(&self) -> bool {
+        self.in_flight.is_none() && (!self.known || self.dirty.is_some())
+    }
+
+    /// Whether a flush is in flight.
+    pub fn flushing(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// The smallest byte-aligned rectangle within the box where `desired`
+    /// differs from `committed`: (x, y, w, h) in pixels.
+    fn changed_within(&self, x0: u16, y0: u16, x1: u16, y1: u16) -> Option<(u16, u16, u16, u16)> {
+        let (bx0, bx1) = (x0 as usize / 8, x1 as usize / 8);
+        let mut found: Option<(usize, usize, usize, usize)> = None;
+        for y in y0 as usize..y1 as usize {
+            for bx in bx0..bx1 {
+                let i = y * BYTES_PER_ROW + bx;
+                if self.desired[i] != self.committed[i] {
+                    found = Some(match found {
+                        None => (bx, y, bx, y),
+                        Some((a, b, c, d)) => (a.min(bx), b.min(y), c.max(bx), d.max(y)),
+                    });
+                }
+            }
+        }
+        let (a, b, c, d) = found?;
+        Some(((a * 8) as u16, b as u16, ((c - a + 1) * 8) as u16, (d - b + 1) as u16))
+    }
+
+    fn write_committed(&mut self, r: &DirtyRegion) {
+        let bytes_w = (r.w / 8) as usize;
+        let x_byte = (r.x / 8) as usize;
+        for row in 0..r.h as usize {
+            let at = (r.y as usize + row) * BYTES_PER_ROW + x_byte;
+            self.committed[at..at + bytes_w].copy_from_slice(&r.data[row * bytes_w..(row + 1) * bytes_w]);
         }
     }
 
@@ -76,6 +188,7 @@ impl FrameBuffer {
         self.desired.fill(0xFF);
         self.committed.fill(0xFF);
         self.dirty = None;
+        self.known = true;
     }
 
     /// Draw one character cell with its top-left corner at pixel (x, y).
@@ -274,6 +387,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_first_flush_is_full_because_the_panel_keeps_its_old_image() {
+        let mut fb = FrameBuffer::new();
+        assert!(fb.needs_flush());
+        let Some(Flush::Full(data)) = fb.begin_flush() else { panic!("expected full") };
+        assert_eq!(data, vec![0xFF; BUF_LEN]);
+        assert!(fb.flushing() && !fb.needs_flush());
+        fb.end_flush(true);
+        assert!(!fb.needs_flush());
+        assert_eq!(fb.begin_flush(), None);
+    }
+
+    fn known() -> FrameBuffer {
+        let mut fb = FrameBuffer::new();
+        fb.begin_flush();
+        fb.end_flush(true);
+        fb
+    }
+
+    #[test]
+    fn a_partial_region_is_tight_and_byte_aligned() {
+        let mut fb = known();
+        fb.fill_rect(13, 7, 1, 1, true); // one pixel
+        fb.fill_rect(30, 9, 2, 1, true); // and two more, two rows down
+        let Some(Flush::Partial(r)) = fb.begin_flush() else { panic!("expected partial") };
+        assert_eq!((r.x, r.y, r.w, r.h), (8, 7, 24, 3));
+        assert_eq!(r.data.len(), 3 * 3);
+        fb.end_flush(true);
+        for i in 0..BUF_LEN {
+            assert_eq!(fb.committed_byte(i), fb.desired_byte(i), "byte {i}");
+        }
+    }
+
+    #[test]
+    fn redrawing_identical_pixels_needs_no_refresh() {
+        let mut fb = known();
+        fb.draw_text(0, 0, FontSize::Medium.font(), "hello");
+        fb.begin_flush();
+        fb.end_flush(true);
+        // The terminal clears and redraws its whole area on every key.
+        fb.fill_rect(0, 0, WIDTH, 40, false);
+        fb.draw_text(0, 0, FontSize::Medium.font(), "hello");
+        assert!(fb.needs_flush(), "something was drawn");
+        assert_eq!(fb.begin_flush(), None, "but nothing changed");
+    }
+
+    #[test]
+    fn only_the_changed_bytes_are_sent_after_a_full_area_redraw() {
+        let mut fb = known();
+        fb.draw_text(0, 0, FontSize::Medium.font(), "hello");
+        fb.begin_flush();
+        fb.end_flush(true);
+        fb.fill_rect(0, 0, WIDTH, HEIGHT, false);
+        fb.draw_text(0, 0, FontSize::Medium.font(), "hellp");
+        let Some(Flush::Partial(r)) = fb.begin_flush() else { panic!("expected partial") };
+        let cell = FontSize::Medium.font().width();
+        assert!(r.x <= 4 * cell && r.x + r.w >= 5 * cell && r.w <= 16, "{:?}", (r.x, r.w));
+    }
+
+    #[test]
+    fn drawing_during_a_flush_is_covered_by_the_next() {
+        let mut fb = known();
+        fb.fill_rect(0, 0, 8, 1, true);
+        let first = fb.begin_flush().unwrap();
+        fb.fill_rect(100, 100, 8, 1, true); // while the panel refreshes
+        fb.end_flush(true);
+        let Some(Flush::Partial(r)) = fb.begin_flush() else { panic!("expected partial") };
+        assert_eq!((r.x, r.y, r.w, r.h), (96, 100, 16, 1));
+        assert_ne!(Some(first), Some(Flush::Partial(r)));
+    }
+
+    #[test]
+    fn a_failed_flush_makes_the_next_one_full() {
+        let mut fb = known();
+        fb.fill_rect(0, 0, 8, 1, true);
+        fb.begin_flush();
+        fb.end_flush(false);
+        assert!(fb.needs_flush());
+        let Some(Flush::Full(data)) = fb.begin_flush() else { panic!("expected full") };
+        assert_eq!(data[0], 0x00);
+        fb.end_flush(true);
+        assert_eq!(fb.begin_flush(), None);
+    }
+
+    #[test]
+    fn committed_is_untouched_until_the_flush_succeeds() {
+        let mut fb = known();
+        fb.fill_rect(0, 0, 8, 1, true);
+        fb.begin_flush();
+        assert_eq!(fb.committed_byte(0), 0xFF);
+        fb.end_flush(true);
+        assert_eq!(fb.committed_byte(0), 0x00);
     }
 
     #[test]

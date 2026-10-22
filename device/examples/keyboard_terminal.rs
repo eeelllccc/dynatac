@@ -8,6 +8,8 @@
 
 #[path = "../src/display.rs"]
 mod display;
+#[path = "../src/i2c_bus.rs"]
+mod i2c_bus;
 #[path = "../src/keyboard.rs"]
 mod keyboard;
 
@@ -23,6 +25,7 @@ use esp_idf_svc::hal::{
 };
 
 use display::Epd;
+use i2c_bus::I2cBus;
 use dynatac_core::font::FontSize;
 use dynatac_core::keymap::KeyEvent;
 use keyboard::Keyboard;
@@ -84,7 +87,8 @@ fn main() {
     )
     .unwrap();
 
-    let mut kb = Keyboard::new(i2c).unwrap();
+    let i2c_bus = I2cBus::new(i2c);
+    let mut kb = Keyboard::new(i2c_bus.device(0x34)).unwrap();
 
     // --- Init display ------------------------------------------------------------
     log::info!("Clearing display");
@@ -143,6 +147,7 @@ fn drain_keys(kb: &mut Keyboard, buf: &mut [char; LINE_COLS], cursor: &mut usize
                             log::info!("key: '{}' cursor={}", ch, cursor);
                         }
                     }
+                    other => log::info!("key: {:?} (ignored)", other),
                 }
             }
             Ok(None) => break,

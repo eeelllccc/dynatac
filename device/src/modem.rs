@@ -66,6 +66,7 @@ use dynatac_core::modem::{
     ModemError, ModemStatus, RegistrationStatus, SimStatus,
 };
 use esp_idf_svc::hal::{
+    delay::TickType,
     gpio::{AnyOutputPin, Output, PinDriver},
     uart::UartDriver,
 };
@@ -86,10 +87,14 @@ const SEND_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to wait for PPP to negotiate an IP address after `CONNECT`.
 const PPP_UP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Per-read blocking tick budget for AT commands. Small so the outer
-/// deadline drives cancellation; the exact value depends on
-/// CONFIG_FREERTOS_HZ but is only a polling granularity.
-const READ_TICKS: u32 = 10;
+/// Per-read blocking budget for AT commands. Small so the outer deadline
+/// drives cancellation; only a polling granularity.
+const READ_MS: u64 = 100;
+
+/// `ms` as FreeRTOS ticks, whatever CONFIG_FREERTOS_HZ is.
+fn ticks(ms: u64) -> u32 {
+    TickType::new_millis(ms).ticks()
+}
 
 pub struct EspA7682EModem<'d> {
     uart: Arc<UartDriver<'d>>,
@@ -202,7 +207,7 @@ impl<'d> EspA7682EModem<'d> {
             if Instant::now() >= deadline {
                 return Err(ModemError::Timeout);
             }
-            let n = match self.uart.read(&mut buf, READ_TICKS) {
+            let n = match self.uart.read(&mut buf, ticks(READ_MS)) {
                 Ok(n) => n,
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
                 Err(e) => return Err(ModemError::Io(format!("{:?}", e))),
@@ -253,7 +258,7 @@ impl<'d> EspA7682EModem<'d> {
             if Instant::now() >= deadline {
                 return Err(ModemError::Timeout);
             }
-            let n = match self.uart.read(&mut buf, READ_TICKS) {
+            let n = match self.uart.read(&mut buf, ticks(READ_MS)) {
                 Ok(n) => n,
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
                 Err(e) => return Err(ModemError::Io(format!("{:?}", e))),
@@ -286,7 +291,7 @@ impl<'d> EspA7682EModem<'d> {
                 log::warn!("modem: ATD*99# timed out waiting for CONNECT");
                 return Err(ModemError::Timeout);
             }
-            let n = match self.uart.read(&mut buf, READ_TICKS) {
+            let n = match self.uart.read(&mut buf, ticks(READ_MS)) {
                 Ok(n) => n,
                 Err(e) if e.code() == ESP_ERR_TIMEOUT => 0,
                 Err(e) => return Err(ModemError::Io(format!("{:?}", e))),
@@ -693,9 +698,9 @@ fn ppp_rx_pump(
     let netif_driver = send_driver.0;
     let mut buf = [0u8; 512];
     let mut signalled_up = false;
-    // Block up to ~50 ms per read so the stop flag is checked at least
+    // Block up to 50 ms per read so the stop flag is checked at least
     // that often even when the line is completely silent.
-    const READ_TICKS_PUMP: u32 = 5;
+    const READ_MS_PUMP: u64 = 50;
 
     // Running totals for a one-line summary at shutdown. Intermediate
     // per-second log lines only fire when there's actual activity, to
@@ -707,7 +712,7 @@ fn ppp_rx_pump(
     log::info!("ppp rx pump started");
 
     while !stop.load(Ordering::Relaxed) {
-        match uart.read(&mut buf, READ_TICKS_PUMP) {
+        match uart.read(&mut buf, ticks(READ_MS_PUMP)) {
             Ok(n) if n > 0 => {
                 bytes_this_sec += n;
                 total_bytes += n as u64;
