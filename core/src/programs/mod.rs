@@ -16,6 +16,7 @@ pub mod battery;
 pub mod curl;
 pub mod echo;
 pub mod email;
+pub mod meteo;
 pub mod modem;
 pub mod net;
 pub mod phone;
@@ -41,15 +42,25 @@ pub struct ExecContext<'a> {
 pub struct ProgramResult {
     pub output: String,
     pub exit_code: i32,
+    pub launch: Option<ProgramLaunch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramLaunch {
+    Meteo,
 }
 
 impl ProgramResult {
     pub fn ok(output: String) -> Self {
-        Self { output, exit_code: 0 }
+        Self { output, exit_code: 0, launch: None }
     }
 
     pub fn err(output: String) -> Self {
-        Self { output, exit_code: 1 }
+        Self { output, exit_code: 1, launch: None }
+    }
+
+    pub fn launch(program: ProgramLaunch) -> Self {
+        Self { output: String::new(), exit_code: 0, launch: Some(program) }
     }
 }
 
@@ -117,6 +128,14 @@ pub static PROGRAMS: &[Program] = &[
         on_list_select: None,
         on_text_submit: Some(email::on_text_submit),
         usage_on_empty: false, // no-args is an error (args required)
+    },
+    Program {
+        name: "meteo",
+        usage: meteo::USAGE,
+        run: meteo::run,
+        on_list_select: None,
+        on_text_submit: Some(meteo::on_text_submit),
+        usage_on_empty: false,
     },
     Program {
         name: "modem",

@@ -10,6 +10,7 @@ pub mod keymap;
 pub mod list_selector;
 pub mod scroll_view;
 pub mod lockscreen;
+pub mod meteo;
 pub mod modem;
 pub mod network;
 pub mod power;

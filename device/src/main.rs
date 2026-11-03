@@ -3,6 +3,7 @@ mod charger;
 mod display;
 mod http;
 mod i2c_bus;
+mod meteo_compat;
 pub mod keyboard;
 mod modem;
 mod nvs_credential_store;
@@ -302,6 +303,7 @@ fn main() {
                                 );
                             }
                             ShellAction::CallActive(_) => {}
+                            ShellAction::Meteo => {}
                         }
                         // Exited list mode — restore input line
                         if was_interactive && !shell.is_interactive() {
@@ -372,6 +374,24 @@ fn main() {
                                             &mut kb,
                                             &number,
                                         );
+                                        term.set_show_input(true);
+                                    }
+                                    ShellAction::Meteo => {
+                                        term.set_show_input(false);
+                                        term.push_output("fetching Leith forecast...");
+                                        render_terminal(&mut epd, &term);
+                                        flush(&mut epd);
+                                        let key = ctx.credentials.meteoblue_api_key()
+                                            .expect("meteo launch requires configured key");
+                                        if let Err(error) = meteo_compat::run(
+                                            &mut epd,
+                                            &mut kb,
+                                            ctx.wifi,
+                                            ctx.modem,
+                                            &key,
+                                        ) {
+                                            term.push_output(&format!("meteo: {error}"));
+                                        }
                                         term.set_show_input(true);
                                     }
                                 }

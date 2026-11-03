@@ -10,7 +10,7 @@
 
 use crate::keymap::KeyEvent;
 use crate::list_selector::{ListAction, ListSelector};
-use crate::programs::{ExecContext, PROGRAMS};
+use crate::programs::{ExecContext, ProgramLaunch, PROGRAMS};
 use crate::scroll_view::{ScrollAction, ScrollStart, ScrollView};
 use crate::text_prompt::{TextPrompt, TextPromptAction};
 
@@ -32,6 +32,8 @@ pub enum ShellAction {
     /// The main loop should enter a blocking in-call state (display timer,
     /// poll for hang-up key and modem URCs) and hang up when done.
     CallActive(String),
+    /// Temporary typed bridge to the graphical meteogram runner.
+    Meteo,
 }
 
 /// Which interactive mode the shell is in.
@@ -207,6 +209,9 @@ impl Shell {
         for program in PROGRAMS {
             if program.name == cmd {
                 let result = (program.run)(args, ctx);
+                if result.launch == Some(ProgramLaunch::Meteo) {
+                    return ShellAction::Meteo;
+                }
                 if result.output == "__POWER_OFF__" {
                     return ShellAction::PowerOff;
                 }
@@ -455,6 +460,7 @@ mod tests {
             ShellAction::PowerOff => panic!("expected Output, got PowerOff"),
             ShellAction::ShipMode => panic!("expected Output, got ShipMode"),
             ShellAction::CallActive(_) => panic!("expected Output, got CallActive"),
+            ShellAction::Meteo => panic!("expected Output, got Meteo"),
         }
     }
 
@@ -473,6 +479,30 @@ mod tests {
         let mut env = Env::new();
         let mut ctx = env.ctx();
         assert_eq!(output(s.execute("echo hello world", &mut ctx)), "hello world");
+    }
+
+    #[test]
+    fn meteo_requires_a_key_then_returns_typed_launch() {
+        let mut shell = Shell::new();
+        let mut env = Env::new();
+        {
+            let mut ctx = env.ctx();
+            assert!(output(shell.execute("meteo", &mut ctx)).contains("meteo setup"));
+        }
+        env.creds.set_meteoblue_api_key("example_key_123").unwrap();
+        let mut ctx = env.ctx();
+        assert!(matches!(shell.execute("meteo", &mut ctx), ShellAction::Meteo));
+    }
+
+    #[test]
+    fn meteo_help_explains_direct_controls() {
+        let mut shell = Shell::new();
+        let mut env = Env::new();
+        let mut ctx = env.ctx();
+        let help = output(shell.execute("meteo help", &mut ctx));
+        assert!(help.contains("y          earlier forecast"));
+        assert!(help.contains("h          later forecast"));
+        assert!(help.contains("Backspace  exit"));
     }
 
     #[test]

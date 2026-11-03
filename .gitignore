@@ -12,3 +12,6 @@ captures/*.log
 captures/.private-number
 
 todo.md
+
+# Local meteoblue credential.
+/API_KEY

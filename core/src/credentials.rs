@@ -37,6 +37,10 @@ pub trait CredentialStore {
     fn whatsapp(&self) -> Option<WhatsappCreds>;
     /// Save (or overwrite) the WhatsApp bridge credentials.
     fn set_whatsapp(&mut self, base_url: &str, bearer_token: &str) -> Result<(), String>;
+
+    /// Meteoblue Forecast API key, kept separately from saved locations.
+    fn meteoblue_api_key(&self) -> Option<String>;
+    fn set_meteoblue_api_key(&mut self, api_key: &str) -> Result<(), String>;
 }
 
 #[cfg(test)]
@@ -88,11 +92,12 @@ pub(crate) mod tests {
     pub struct MockCredentialStore {
         gmail: Option<GmailCreds>,
         whatsapp: Option<WhatsappCreds>,
+        meteoblue_api_key: Option<String>,
     }
 
     impl MockCredentialStore {
         pub fn new() -> Self {
-            Self { gmail: None, whatsapp: None }
+            Self { gmail: None, whatsapp: None, meteoblue_api_key: None }
         }
     }
 
@@ -126,6 +131,13 @@ pub(crate) mod tests {
                 base_url: base_url.to_string(),
                 bearer_token: bearer_token.to_string(),
             });
+            Ok(())
+        }
+        fn meteoblue_api_key(&self) -> Option<String> {
+            self.meteoblue_api_key.clone()
+        }
+        fn set_meteoblue_api_key(&mut self, api_key: &str) -> Result<(), String> {
+            self.meteoblue_api_key = Some(api_key.to_string());
             Ok(())
         }
     }

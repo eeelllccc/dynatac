@@ -17,6 +17,7 @@ const KEY_ADDR: &str = "gmail_addr";
 const KEY_PW: &str = "gmail_pw";
 const KEY_WA_URL: &str = "wa_url";
 const KEY_WA_TOKEN: &str = "wa_token";
+const KEY_METEOBLUE: &str = "meteo_key";
 
 /// Max length of a single NVS string value we read.
 const MAX_NVS_STR_LEN: usize = 256;
@@ -79,6 +80,17 @@ impl CredentialStore for NvsCredentialStore {
         self.nvs
             .set_str(KEY_WA_TOKEN, bearer_token)
             .map_err(|e| format!("nvs set {}: {:?}", KEY_WA_TOKEN, e))?;
+        Ok(())
+    }
+
+    fn meteoblue_api_key(&self) -> Option<String> {
+        self.get_str(KEY_METEOBLUE)
+    }
+
+    fn set_meteoblue_api_key(&mut self, api_key: &str) -> Result<(), String> {
+        self.nvs
+            .set_str(KEY_METEOBLUE, api_key)
+            .map_err(|e| format!("nvs set {}: {:?}", KEY_METEOBLUE, e))?;
         Ok(())
     }
 }
